@@ -272,10 +272,19 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             tail_dst.tail = -1;
             if (cell_dst.seq_id.empty()) {
                 cell_dst.pos = -1;
+                cell_dst.rs_pos_min = -1;
                 cell_dst.src = -1;
                 used -= 1;
             }
         }
+
+        // A copied sequence aliases the source recurrent state. If the source
+        // is currently represented by a rollback snapshot, the destination
+        // must select the same snapshot until the next graph materializes it.
+        if ((uint32_t) seq_id_src < rs_idx.size() && (uint32_t) seq_id_dst < rs_idx.size()) {
+            rs_idx[seq_id_dst] = tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0;
+        }
+
         if (tail_src.tail >= 0) {
             auto & cell_src = cells[tail_src.tail];
 
@@ -288,6 +297,15 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
 
+    // Discard rollback selectors together with the sequences they belong to.
+    // Keeping a stale selector makes a later reuse of that sequence id read an
+    // unrelated historical snapshot plane.
+    for (size_t i = 0; i < rs_idx.size(); ++i) {
+        if ((llama_seq_id) i != seq_id) {
+            rs_idx[i] = 0;
+        }
+    }
+
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
             cells[i].tail = -1;
@@ -299,6 +317,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
             }
 
             cells[i].pos = -1;
+            cells[i].rs_pos_min = -1;
             cells[i].src = -1;
             cells[i].seq_id.clear();
 
@@ -550,10 +569,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     seq.tail = -1;
                     if (cell.seq_id.empty()) {
                         cell.pos = -1;
+                        cell.rs_pos_min = -1;
                         cell.src = -1;
                         used -= 1;
                     }
                 }
+
+                // The first seq_id owns the recurrent source selected below.
+                // Any additional ids become aliases of that same logical
+                // state, including a pending rollback snapshot.
+                const llama_seq_id seq_id_primary = ubatch.seq_id[i][0];
+                GGML_ASSERT(seq_id_primary >= 0 && (size_t) seq_id_primary < rs_idx.size());
+                GGML_ASSERT(seq_id         >= 0 && (size_t) seq_id         < rs_idx.size());
+                rs_idx[seq_id] = rs_idx[seq_id_primary];
             }
         }
     }
@@ -1323,13 +1351,25 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
 
     uint32_t idx = 0;
-    if (!mem->cells[cell_idx].seq_id.empty()) {
-        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
-        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+    bool have_idx = false;
+    for (const llama_seq_id seq : mem->cells[cell_idx].seq_id) {
+        GGML_ASSERT(seq >= 0 && (size_t) seq < mem->rs_idx.size());
+
+        if (!have_idx) {
             idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
+            have_idx = true;
+        } else {
+            // All aliases of one physical recurrent cell must refer to the
+            // same logical snapshot.
+            GGML_ASSERT(mem->rs_idx[seq] == idx);
         }
     }
+
+    // Materializing the selected source consumes the pending rollback for
+    // every sequence aliasing this cell, not just the first seq_id.
+    for (const llama_seq_id seq : mem->cells[cell_idx].seq_id) {
+        mem->rs_idx[seq] = 0;
+    }
+
     return (int32_t)(idx * mem->size) + src0;
 }

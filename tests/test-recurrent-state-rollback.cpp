@@ -297,6 +297,208 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
+
+static bool test_seq_alias_rollback(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
+    if (n_vocab <= 1) {
+        fprintf(stderr, "%s : skipping because vocabulary is too small\n", __func__);
+        return true;
+    }
+
+    constexpr uint32_t  n_prompt       = 12;
+    constexpr uint32_t  src_rollback   = 3;
+    constexpr uint32_t  dst_rollback   = 2;
+    constexpr llama_pos src_p0         = n_prompt - src_rollback;
+    constexpr llama_pos dst_p0         = n_prompt - dst_rollback;
+    constexpr float     eps            = 1e-5f;
+
+    const auto make_ctx_alias = [&]() {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 2;
+        cparams.n_rs_seq   = 8;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = false;
+        return init_ctx(model, cparams, fill);
+    };
+
+    const auto tok = [&](uint32_t stream, llama_pos pos) {
+        return (llama_token) ((13*(uint32_t) pos + 47*stream + 5) % (uint32_t) n_vocab);
+    };
+
+    const auto decode_range = [&](llama_context * ctx, llama_seq_id seq_id, uint32_t stream, llama_pos p0, llama_pos p1) {
+        const uint32_t count = (uint32_t) (p1 - p0);
+        llama_batch batch = llama_batch_init(count, 0, 1);
+        for (llama_pos pos = p0; pos < p1; ++pos) {
+            common_batch_add(batch, tok(stream, pos), pos, { seq_id }, pos + 1 == p1);
+        }
+        const bool ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    const auto decode_step = [&](llama_context * ctx, llama_seq_id seq_id, uint32_t stream, llama_pos pos) {
+        llama_batch batch = llama_batch_init(1, 0, 1);
+        common_batch_add(batch, tok(stream, pos), pos, { seq_id }, true);
+        const bool ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    const auto decode_shared = [&](llama_context * ctx, llama_seq_id primary, llama_seq_id secondary, uint32_t stream, llama_pos pos) {
+        llama_batch batch = llama_batch_init(1, 0, 2);
+        common_batch_add(batch, tok(stream, pos), pos, { primary, secondary }, true);
+        const bool ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    const auto logits_match = [&](llama_context * a, llama_context * b, const char * label) {
+        const float * la = llama_get_logits_ith(a, 0);
+        const float * lb = llama_get_logits_ith(b, 0);
+        if (la == nullptr || lb == nullptr) {
+            fprintf(stderr, "%s : %s missing logits\n", __func__, label);
+            return false;
+        }
+
+        float diff_max = 0.0f;
+        for (int token = 0; token < n_vocab; ++token) {
+            diff_max = std::max(diff_max, logit_diff(la[token], lb[token]));
+        }
+        if (diff_max > eps) {
+            fprintf(stderr, "%s : %s logits mismatch (max diff %g)\n",
+                    __func__, label, (double) diff_max);
+            return false;
+        }
+        return true;
+    };
+
+    // seq_cp must copy the source's pending rollback selector and overwrite a
+    // different pending selector already owned by the destination.
+    {
+        llama_context * ctx = make_ctx_alias();
+        llama_context * ref = make_ctx_alias();
+        if (ctx == nullptr || ref == nullptr) {
+            if (ctx != nullptr) llama_free(ctx);
+            if (ref != nullptr) llama_free(ref);
+            fprintf(stderr, "%s : failed to initialize seq_cp contexts\n", __func__);
+            return false;
+        }
+
+        bool ok =
+            decode_range(ctx, 0, 0, 0, n_prompt) &&
+            decode_range(ref, 0, 0, 0, n_prompt) &&
+            decode_range(ctx, 1, 1, 0, n_prompt) &&
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, src_p0, -1) &&
+            llama_memory_seq_rm(llama_get_memory(ref), 0, src_p0, -1) &&
+            llama_memory_seq_rm(llama_get_memory(ctx), 1, dst_p0, -1);
+
+        if (ok) {
+            llama_memory_seq_cp(llama_get_memory(ctx), 0, 1, 0, -1);
+            llama_memory_seq_keep(llama_get_memory(ctx), 1);
+
+            for (uint32_t i = 0; i < src_rollback && ok; ++i) {
+                const llama_pos pos = src_p0 + (llama_pos) i;
+                ok = decode_step(ctx, 1, 0, pos) &&
+                     decode_step(ref, 0, 0, pos) &&
+                     logits_match(ctx, ref, "seq_cp pending rollback");
+            }
+        }
+
+        llama_free(ctx);
+        llama_free(ref);
+
+        if (!ok) {
+            fprintf(stderr, "%s : seq_cp rollback alias test failed\n", __func__);
+            return false;
+        }
+    }
+
+    // When independent sequences become aliases in a multi-id token, the
+    // first seq_id in the batch owns the source state even when it is not the
+    // lowest numerical id. Both aliases must consume the same rollback index.
+    {
+        llama_context * ctx = make_ctx_alias();
+        llama_context * ref = make_ctx_alias();
+        if (ctx == nullptr || ref == nullptr) {
+            if (ctx != nullptr) llama_free(ctx);
+            if (ref != nullptr) llama_free(ref);
+            fprintf(stderr, "%s : failed to initialize shared-state contexts\n", __func__);
+            return false;
+        }
+
+        bool ok =
+            decode_range(ctx, 1, 0, 0, n_prompt) &&
+            decode_range(ref, 1, 0, 0, n_prompt) &&
+            decode_range(ctx, 0, 1, 0, n_prompt) &&
+            llama_memory_seq_rm(llama_get_memory(ctx), 1, src_p0, -1) &&
+            llama_memory_seq_rm(llama_get_memory(ref), 1, src_p0, -1) &&
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, dst_p0, -1);
+
+        if (ok) {
+            // primary=1 deliberately sorts after secondary=0 in std::set.
+            ok = decode_shared(ctx, 1, 0, 0, src_p0) &&
+                 decode_step(ref, 1, 0, src_p0) &&
+                 logits_match(ctx, ref, "shared rollback materialization");
+        }
+
+        if (ok) {
+            // s_copy() must have consumed the rollback selector for seq 1 too.
+            llama_memory_seq_keep(llama_get_memory(ctx), 1);
+            ok = decode_step(ctx, 1, 0, src_p0 + 1) &&
+                 decode_step(ref, 1, 0, src_p0 + 1) &&
+                 logits_match(ctx, ref, "shared rollback consumption");
+        }
+
+        llama_free(ctx);
+        llama_free(ref);
+
+        if (!ok) {
+            fprintf(stderr, "%s : shared rollback alias test failed\n", __func__);
+            return false;
+        }
+    }
+
+    // seq_keep must clear pending rollback selectors for discarded sequence
+    // ids so that reusing an id starts from the new sequence's actual state.
+    {
+        llama_context * ctx = make_ctx_alias();
+        llama_context * ref = make_ctx_alias();
+        if (ctx == nullptr || ref == nullptr) {
+            if (ctx != nullptr) llama_free(ctx);
+            if (ref != nullptr) llama_free(ref);
+            fprintf(stderr, "%s : failed to initialize seq_keep contexts\n", __func__);
+            return false;
+        }
+
+        bool ok =
+            decode_range(ctx, 0, 0, 0, 4) &&
+            decode_range(ref, 0, 0, 0, 4) &&
+            decode_range(ctx, 1, 1, 0, n_prompt) &&
+            llama_memory_seq_rm(llama_get_memory(ctx), 1, src_p0, -1);
+
+        if (ok) {
+            llama_memory_seq_keep(llama_get_memory(ctx), 0);
+            llama_memory_seq_keep(llama_get_memory(ref), 0);
+
+            ok = decode_step(ctx, 1, 2, 0) &&
+                 decode_step(ref, 1, 2, 0) &&
+                 logits_match(ctx, ref, "seq_keep reused sequence id");
+        }
+
+        llama_free(ctx);
+        llama_free(ref);
+
+        if (!ok) {
+            fprintf(stderr, "%s : seq_keep rollback cleanup test failed\n", __func__);
+            return false;
+        }
+    }
+
+    fprintf(stderr, "%s : recurrent sequence alias rollback tests passed\n", __func__);
+    return true;
+}
+
 static int test_rollback(const common_params & params, llama_model * model, uint8_t fill) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
@@ -406,6 +608,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     // run the clean-reference check before the dirty-ctx restore test below,
     // so a failure there does not mask whether in-place rollback is exact
     if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
+        return 1;
+    }
+    if (!test_seq_alias_rollback(params, model, n_vocab, fill)) {
         return 1;
     }
 
