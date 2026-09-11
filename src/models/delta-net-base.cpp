@@ -13,6 +13,10 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t 
 
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
+ggml_tensor * llm_build_delta_net_base::build_rs(llm_graph_input_rs * inp, ggml_tensor * s, int32_t state_size, int32_t n_seqs) const {
+    return llm_graph_context::build_rs(inp, s, state_size, n_seqs, ggml_get_rows, true);
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -495,11 +499,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
     } else {
-        // [TAG_RECURRENT_ROLLBACK_SPLITS]
-        // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
-        //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
-
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        // Keep the older snapshots copied by build_rs.
+        const int64_t K = std::min<int64_t>(cparams.n_rs_seq + 1, ubatch.n_seq_tokens);
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -588,6 +589,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
+    {
+        static int dbg_count = 0;
+        if (getenv("GDN_DBG") && dbg_count < 6) {
+            fprintf(stderr, "[GDN_DBG] il=%d K=%ld n_seq_tokens=%ld n_seqs=%ld D=%ld n_written=%ld\n",
+                    il, (long) K, (long) n_seq_tokens, (long) n_seqs, (long) D, (long) n_written);
+            fprintf(stderr, "[GDN_DBG] gdn_out: ne=[%ld,%ld,%ld,%ld] nbytes=%zu\n",
+                    gdn_out->ne[0], gdn_out->ne[1], gdn_out->ne[2], gdn_out->ne[3], ggml_nbytes(gdn_out));
+            fprintf(stderr, "[GDN_DBG] ssm_states_all: ne=[%ld,%ld] nb1=%zu row_size=%zu kv_head=%ld mem_size=%u\n",
+                    ssm_states_all->ne[0], ssm_states_all->ne[1], ssm_states_all->nb[1], row_size, (long) kv_head, mem_size);
+            fprintf(stderr, "[GDN_DBG] attn_score_elems=%ld state_size_per_snap=%ld\n",
+                    (long) attn_score_elems, (long) state_size_per_snap);
+            ++dbg_count;
+        }
+    }
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
         D, n_seqs, n_written,
         ggml_row_size(gdn_out->type, D),

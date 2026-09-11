@@ -96,7 +96,7 @@ static float logit_diff(float a, float b) {
 // reference context that never advanced past the rollback point and decodes
 // the identical replay batch.
 static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
-    constexpr uint32_t  n_seqs     = 2;
+    constexpr uint32_t  n_seqs     = 3;
     constexpr uint32_t  n_ubatch   = 16;
     constexpr uint32_t  n_prompt   = 19;
     constexpr uint32_t  n_rollback = 3;
@@ -215,6 +215,41 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     }
 
     fprintf(stderr, "%s : multi-seq split replay matched (max diff %g)\n", __func__, (double) diff_max);
+
+    // Reorder two sequences around an idle sequence, then roll back the idle sequence.
+    const llama_pos end_pos = p0 + n_replay;
+    llama_batch move_batch = llama_batch_init(2, 0, 1);
+    common_batch_add(move_batch, tok(2, end_pos), end_pos, { 2 }, false);
+    common_batch_add(move_batch, tok(0, end_pos), end_pos, { 0 }, false);
+    ok = llama_decode(ctx_roll, move_batch) == 0;
+    llama_batch_free(move_batch);
+    ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll), 1, end_pos - n_rollback, -1);
+    ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_ref), 1, end_pos - n_rollback, -1);
+    float diff_move = 0.0f;
+    for (uint32_t i = 0; i < n_rollback && ok; ++i) {
+        const llama_pos pos = end_pos - n_rollback + i;
+        llama_batch replay = llama_batch_init(1, 0, 1);
+        common_batch_add(replay, tok(1, pos), pos, { 1 }, true);
+        ok = llama_decode(ctx_roll, replay) == 0 && llama_decode(ctx_ref, replay) == 0;
+        llama_batch_free(replay);
+        if (ok) {
+            const float * a = llama_get_logits_ith(ctx_roll, 0);
+            const float * b = llama_get_logits_ith(ctx_ref, 0);
+            if (a == nullptr || b == nullptr) {
+                ok = false;
+                break;
+            }
+            for (int t = 0; t < n_vocab; ++t) {
+                diff_move = std::max(diff_move, logit_diff(a[t], b[t]));
+            }
+        }
+    }
+    if (!ok || diff_move > eps) {
+        fprintf(stderr, "%s : moved sequence rollback mismatch (ok=%d, max diff %g)\n", __func__, ok ? 1 : 0, (double) diff_move);
+        cleanup();
+        return false;
+    }
+    fprintf(stderr, "%s : moved sequence rollback matched (max diff %g)\n", __func__, (double) diff_move);
 
     // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
     // in ctx_ref only, then compare identical seq-1-only continuations bitwise
@@ -368,6 +403,12 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         return 1;
     }
 
+    // run the clean-reference check before the dirty-ctx restore test below,
+    // so a failure there does not mask whether in-place rollback is exact
+    if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
+        return 1;
+    }
+
     // Repeat the load into a context that already has its own rollback state:
     // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
     // non-zero at load time. The restore must wipe that state and still match.
@@ -421,10 +462,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     llama_free(ctx_src);
     llama_free(ctx_dst);
     llama_free(ctx_dirty);
-
-    if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
-        return 1;
-    }
 
     return 0;
 }

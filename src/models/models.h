@@ -36,6 +36,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     virtual ~llm_build_delta_net_base() = default;
 
+    ggml_tensor * build_rs(llm_graph_input_rs * inp, ggml_tensor * s, int32_t state_size, int32_t n_seqs) const;
+
     // returns pair of output and new state
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_chunking(
                 ggml_tensor * q,

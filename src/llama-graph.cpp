@@ -327,8 +327,6 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
     const int64_t n_rs = mctx->get_n_rs();
 
     if (s_copy) {
@@ -338,6 +336,34 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
+        }
+    }
+    set_input_history(ubatch);
+}
+
+void llm_graph_input_rs::set_input_history(const llama_ubatch * ubatch) {
+    if (!s_copy_history) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_history->buffer));
+    const auto * src = (const int32_t *) s_copy->data;
+    auto * dst = (int32_t *) s_copy_history->data;
+    const int32_t size = mctx->get_size();
+    const int32_t n_seqs = ubatch->n_seqs;
+    const int32_t n_history = std::max<int32_t>(0, (int32_t) n_rs_seq + 1 - (int32_t) ubatch->n_seq_tokens);
+    const int32_t last_slot = n_rs_seq;
+    for (int32_t h = 0; h < n_history; ++h) {
+        for (int32_t s = 0; s < n_seqs; ++s) {
+            dst[h*n_seqs + s] = std::min(src[s]/size + h, last_slot)*size + src[s]%size;
+        }
+    }
+    const int32_t n_extra = mctx->get_n_rs() - n_seqs;
+    dst += n_seqs*n_history;
+    for (int32_t h = 1; h <= last_slot; ++h) {
+        for (int32_t s = 0; s < n_extra; ++s) {
+            const int32_t row = src[n_seqs + s];
+            dst[(h - 1)*n_extra + s] = std::min(row/size + h, last_slot)*size + row%size;
         }
     }
 }
@@ -1111,6 +1137,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    inp_rs->mctx = mctx->get_recr();
+    inp_rs->set_input_history(ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1155,6 +1183,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    inp_rs->mctx = mctx->get_recr();
+    inp_rs->set_input_history(ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1229,6 +1259,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    inp_rs->mctx = mctx->get_recr();
+    inp_rs->set_input_history(ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -3473,15 +3505,23 @@ ggml_tensor * llm_graph_context::build_rs(
            uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+        ggml_tensor * state_copy_history,
+            int32_t   n_seq_tokens) const {
 
-    GGML_UNUSED(rs_size);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+
+    // Read history before state copies can overwrite its source cells.
+    ggml_tensor * history = nullptr;
+    if (state_copy_history) {
+        history = ggml_get_rows(ctx0, states, state_copy_history);
+        ggml_build_forward_expand(gf, history);
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
@@ -3495,6 +3535,24 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_cpy(ctx0,
             states_extra,
             ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+
+    if (history) {
+        const int64_t n_slots = s->ne[1] / rs_size;
+        const int64_t n_history = std::max<int64_t>(0, n_slots - n_seq_tokens);
+        if (n_history > 0) {
+            ggml_tensor * src = ggml_view_2d(ctx0, history, state_size, n_seqs*n_history, history->nb[1], 0);
+            ggml_tensor * dst = ggml_view_3d(ctx0, s, state_size, n_seqs, n_history,
+                    s->nb[1], rs_size*s->nb[1], (n_seq_tokens*rs_size + rs_head)*s->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+        if (n_rs > (uint32_t) n_seqs) {
+            const int64_t n_extra = n_rs - n_seqs;
+            ggml_tensor * src = ggml_view_2d(ctx0, history, state_size, n_extra*(n_slots - 1), history->nb[1], n_seqs*n_history*history->nb[1]);
+            ggml_tensor * dst = ggml_view_3d(ctx0, s, state_size, n_extra, n_slots - 1,
+                    s->nb[1], rs_size*s->nb[1], (rs_size + rs_head + n_seqs)*s->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+    }
 
     return output_states;
 }
@@ -3534,12 +3592,23 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
             int32_t   state_size,
             int32_t   n_seqs,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   keep_history) const {
     const auto * kv_state = inp->mctx;
+
+    if (keep_history && cparams.n_rs_seq > 0 && !inp->s_copy_history) {
+        const int64_t n_history = std::max<int64_t>(0, (int64_t) cparams.n_rs_seq + 1 - ubatch.n_seq_tokens);
+        const int64_t n_rows = n_seqs*n_history + (kv_state->get_n_rs() - n_seqs)*cparams.n_rs_seq;
+        if (n_rows > 0) {
+            inp->n_rs_seq = cparams.n_rs_seq;
+            inp->s_copy_history = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+            ggml_set_input(inp->s_copy_history);
+        }
+    }
 
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    get_state_rows, keep_history ? inp->s_copy_history : nullptr, ubatch.n_seq_tokens);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

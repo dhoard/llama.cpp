@@ -123,6 +123,51 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+// DEBUG: residual stream capture registry
+static std::map<const void *, std::vector<ggml_tensor *>> g_dbg_map;
+// DEBUG: attention intermediate capture registry: key = ctx0, value indexed by il*8+tag
+static std::map<const void *, std::vector<ggml_tensor *>> g_dbg_attn;
+
+// DEBUG: dump captured residual streams to <prefix>_<ctxidx>_<il>.bin
+extern "C" void qwen35_dbg_dump(const char * prefix) {
+    int ctxidx = 0;
+    for (auto & kv : g_dbg_map) {
+        char path[256];
+        for (size_t il = 0; il < kv.second.size(); ++il) {
+            ggml_tensor * t = kv.second[il];
+            if (!t) continue;
+            fprintf(stderr, "DBGDUMP ctx=%d il=%zu ne=[%ld,%ld] data=%p\n",
+                    ctxidx, il, (long) t->ne[0], (long) t->ne[1], (void *) t->data);
+            snprintf(path, sizeof(path), "%s_%d_%zu.bin", prefix, ctxidx, il);
+            FILE * f = fopen(path, "wb");
+            if (!f) continue;
+            const size_t n = (size_t) t->ne[0] * t->ne[1];
+            fwrite(t->data, 4, n, f);
+            fclose(f);
+        }
+        ++ctxidx;
+    }
+    ctxidx = 0;
+    for (auto & kv : g_dbg_attn) {
+        char path[256];
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            ggml_tensor * t = kv.second[i];
+            if (!t || !t->data) continue;
+            const int il = (int) (i / 8);
+            const int tag = (int) (i % 8);
+            snprintf(path, sizeof(path), "%s_attn_%d_%d_%d.bin", prefix, ctxidx, il, tag);
+            FILE * f = fopen(path, "wb");
+            if (!f) continue;
+            const size_t n = (size_t) t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3];
+            fwrite(t->data, 4, n, f);
+            fprintf(stderr, "DBGATTN ctx=%d il=%d tag=%d ne=[%ld,%ld,%ld,%ld] n=%zu\n",
+                    ctxidx, il, tag, (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], (long) t->ne[3], n);
+            fclose(f);
+        }
+        ++ctxidx;
+    }
+}
+
 std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
@@ -197,6 +242,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
+
+        // DEBUG: capture residual stream at layer boundary (overwrite: last-built graph wins)
+        if (getenv("QWEN35_DBG")) {
+            auto & v = g_dbg_map[ctx0];
+            if (v.size() != (size_t) n_layer) v.assign(n_layer, nullptr);
+            const int64_t ne[2] = { cur->ne[0], cur->ne[1] };
+            ggml_tensor * t = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2, ne);
+            ggml_set_output(t);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, t));
+            v[il] = t;
+        }
 
         // Input for next layer
         inpL = cur;
@@ -312,6 +368,21 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
+    // DEBUG: capture attention intermediates for full-attn layers
+    if (getenv("QWEN35_DBG") && il % 4 == 3 && il < 8) {
+        auto & v = g_dbg_attn[ctx0];
+        if (v.size() < 64) v.resize(64, nullptr);
+        const int tags[3] = { 0, 1, 2 }; // Q, K, V
+        ggml_tensor * srcs[3] = { Qcur, Kcur, Vcur };
+        for (int tt = 0; tt < 3; ++tt) {
+            const int64_t ne[4] = { srcs[tt]->ne[0], srcs[tt]->ne[1], srcs[tt]->ne[2], srcs[tt]->ne[3] };
+            ggml_tensor * t = ggml_new_tensor(ctx0, GGML_TYPE_F32, 4, ne);
+            ggml_set_output(t);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, srcs[tt], t));
+            v[il * 8 + tags[tt]] = t;
+        }
+    }
+
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -320,14 +391,44 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
 
+    // DEBUG: capture attn_pregate
+    if (getenv("QWEN35_DBG") && il % 4 == 3 && il < 8) {
+        auto & v = g_dbg_attn[ctx0];
+        const int64_t ne[2] = { cur->ne[0], cur->ne[1] };
+        ggml_tensor * t = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2, ne);
+        ggml_set_output(t);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, t));
+        v[il * 8 + 3] = t;
+    }
+
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
 
     cur = ggml_mul(ctx0, cur, gate_sigmoid);
     cb(cur, "attn_gated", il);
 
+    // DEBUG: capture attn_gated
+    if (getenv("QWEN35_DBG") && il % 4 == 3 && il < 8) {
+        auto & v = g_dbg_attn[ctx0];
+        const int64_t ne[2] = { cur->ne[0], cur->ne[1] };
+        ggml_tensor * t = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2, ne);
+        ggml_set_output(t);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, t));
+        v[il * 8 + 4] = t;
+    }
+
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
+
+    // DEBUG: capture attn_output
+    if (getenv("QWEN35_DBG") && il % 4 == 3 && il < 8) {
+        auto & v = g_dbg_attn[ctx0];
+        const int64_t ne[2] = { cur->ne[0], cur->ne[1] };
+        ggml_tensor * t = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2, ne);
+        ggml_set_output(t);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, t));
+        v[il * 8 + 5] = t;
+    }
 
     return cur;
 }

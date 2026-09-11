@@ -3944,6 +3944,24 @@ static void ggml_compute_forward_rms_norm_f32(
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // DEBUG: dump last-token-column of the norm input (residual stream capture)
+    if (getenv("RSN_DBG") && ne00 == 4096 && ne02 == 1 && ne03 == 1) {
+        static volatile int rsn_dbg_counter = 0;
+        const int c = __atomic_fetch_add((int *) &rsn_dbg_counter, 1, __ATOMIC_RELAXED);
+        if (c < 800) {
+            const float * x = (const float *)((char *)src0->data + (ne01 - 1) * nb01);
+            std::vector<float> buf(2 + ne00);
+            buf[0] = (float) ne01;
+            buf[1] = (float) c;
+            memcpy(&buf[2], x, ne00 * sizeof(float));
+            FILE * f = fopen("/dbg/rsn.bin", "ab");
+            if (f) {
+                fwrite(buf.data(), sizeof(float), buf.size(), f);
+                fclose(f);
+            }
+        }
+    }
+
     float eps;
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
@@ -6202,6 +6220,22 @@ static void ggml_compute_forward_rope_flt(
                 T * src = (T *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01);
                 T * dst_data  = (T *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1);
 
+                // DEBUG: capture pos, cache, src before rotation
+                float dbg_cache[256];
+                float * dbg_src_f = nullptr;
+                int dbg_rc = -1;
+                bool dbg_on = false;
+                if (getenv("ROPE_DBG") && ne2 <= 2 && i1 == 0 && ne0 <= 256) {
+                    static volatile int rope_dbg_counter = 0;
+                    dbg_rc = __atomic_fetch_add((int *) &rope_dbg_counter, 1, __ATOMIC_RELAXED);
+                    if (dbg_rc < 400) {
+                        dbg_on = true;
+                        memcpy(dbg_cache, cache, ne0 * sizeof(float));
+                        dbg_src_f = (float *) malloc(ne0 * sizeof(float));
+                        for (int64_t i0 = 0; i0 < ne0; ++i0) dbg_src_f[i0] = type_conversion_table<T>::to_f32(src[i0]);
+                    }
+                }
+
                 switch (mode) {
                     case GGML_ROPE_TYPE_NORMAL:
                         rotate_pairs<T>(n_dims, 1, cache, src + n_offs, dst_data + n_offs, 1);
@@ -6231,6 +6265,28 @@ static void ggml_compute_forward_rope_flt(
                         dst_data[0] = src[0];
                         dst_data[1] = src[1];
                     }
+                }
+
+                // DEBUG: capture full row (pos, cache, src, dst) after computation
+                if (dbg_on) {
+                    std::vector<float> buf;
+                    buf.reserve(8 + ne0 * 3);
+                    buf.push_back((float) i3); buf.push_back((float) i2); buf.push_back((float) i1); buf.push_back((float) dbg_rc);
+                    if (mrope_used) {
+                        buf.push_back((float) pos[i2]);
+                        buf.push_back((float) pos[i2 + ne2]);
+                        buf.push_back((float) pos[i2 + ne2 * 2]);
+                        buf.push_back((float) pos[i2 + ne2 * 3]);
+                    } else {
+                        buf.push_back((float) pos[i2]);
+                        buf.push_back(0); buf.push_back(0); buf.push_back(0);
+                    }
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) buf.push_back(dbg_cache[i0]);
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) buf.push_back(dbg_src_f[i0]);
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) buf.push_back(type_conversion_table<T>::to_f32(dst_data[i0]));
+                    FILE * f = fopen("/dbg/rope_row.bin", "ab");
+                    if (f) { fwrite(buf.data(), sizeof(float), buf.size(), f); fclose(f); }
+                    free((void *) dbg_src_f);
                 }
             } //attn-heads
         }
@@ -11039,6 +11095,54 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
                                      (iv3 * H + iv1) * S_v * S_v;
                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                }
+            }
+        }
+
+        // DEBUG: dump inputs (head 0, seq 0) and states for this layer call
+        if (getenv("GDN_IN_DBG") && iv3 == 0 && iv1 == 0) {
+            static volatile int gdn_dbg_counter = 0;
+            const int c = __atomic_fetch_add((int *) &gdn_dbg_counter, 1, __ATOMIC_RELAXED);
+            if (c < 400) {
+                FILE * f = fopen("/dbg/gdn_in.bin", "ab");
+                if (f) {
+                    const int64_t hdr[2] = { n_tokens, K };
+                    fwrite(hdr, sizeof(int64_t), 2, f);
+                    // input state
+                    fwrite(s_in, sizeof(float), S_v * S_v, f);
+                    // per-token q,k,v,g,beta (up to 4 tokens)
+                    const int64_t nt_dump = n_tokens < 4 ? n_tokens : 4;
+                    for (int64_t t = 0; t < nt_dump; ++t) {
+                        const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
+                        const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
+                        const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+                        const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+                        const float * g_d    = (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+                        fwrite(q_d, sizeof(float), S_v, f);
+                        fwrite(k_d, sizeof(float), S_v, f);
+                        fwrite(v_d, sizeof(float), S_v, f);
+                        if (kda) {
+                            fwrite(g_d, sizeof(float), S_v, f);
+                        } else {
+                            float g1[128];
+                            memset(g1, 0, sizeof(g1));
+                            g1[0] = g_d[0];
+                            fwrite(g1, sizeof(float), S_v, f);
+                        }
+                        fwrite(&beta_val, sizeof(float), 1, f);
+                    }
+                    // final state (slot 0)
+                    const float * fin = (K > 1) ? state_work : state_out_base;
+                    fwrite(fin, sizeof(float), S_v * S_v, f);
+                    // slot 1 (state after first token) if available
+                    if (K > 1 && n_tokens >= 2) {
+                        const float * s1 = state_out_base + 1 * state_size_per_snap;
+                        fwrite(s1, sizeof(float), S_v * S_v, f);
+                    } else {
+                        static float zeros[128 * 128];
+                        fwrite(zeros, sizeof(float), S_v * S_v, f);
+                    }
+                    fclose(f);
                 }
             }
         }

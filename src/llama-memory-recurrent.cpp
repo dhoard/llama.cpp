@@ -141,6 +141,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
+        cells[i].rs_pos_min = -1;
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
@@ -195,7 +196,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq && p0 - 1 >= cell.rs_pos_min) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -230,6 +231,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     used--;
                 }
                 cells[i].pos = -1;
+                cells[i].rs_pos_min = -1;
                 cells[i].src = -1;
                 if (new_head == size) {
                     new_head = i;
@@ -340,6 +342,7 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos += shift;
+                cell.rs_pos_min += shift;
             }
         }
     }
@@ -370,6 +373,7 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos /= d;
+                cell.rs_pos_min = cell.pos;
             }
         }
     }
@@ -604,6 +608,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (seq_meta.tail >= 0) {
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
+                empty_cell.rs_pos_min = orig_cell.rs_pos_min;
                 empty_cell.src = orig_cell.src;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
@@ -634,6 +639,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             auto & src_cell = cells[src_id];
 
             std::swap(dst_cell.pos, src_cell.pos);
+            std::swap(dst_cell.rs_pos_min, src_cell.rs_pos_min);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
@@ -662,6 +668,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
+        if (cell.pos < 0) {
+            cell.rs_pos_min = ubatch.pos[i] - 1;
+        }
+        cell.rs_pos_min = std::max(cell.rs_pos_min, last_pos - (llama_pos) n_rs_seq);
         cell.pos = last_pos;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
@@ -1080,6 +1090,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         uint32_t cell_id = head + i;
         // make sure the recurrent states will keep their restored state
         cells[cell_id].src = cell_id;
+        cells[cell_id].rs_pos_min = cells[cell_id].pos;
     }
 
     return true;

@@ -87,6 +87,7 @@ public:
     // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;
+        llama_pos rs_pos_min = -1; // oldest available rollback position
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;

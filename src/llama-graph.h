@@ -269,6 +269,10 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_copy_history = nullptr; // I32 [n_seqs * n_history + (n_rs - n_seqs) * n_rs_seq]
+    uint32_t n_rs_seq = 0;
+
+    void set_input_history(const llama_ubatch * ubatch);
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
@@ -1330,7 +1334,9 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
+            ggml_tensor * state_copy_history = nullptr,
+                int32_t   n_seq_tokens = 0) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
@@ -1339,7 +1345,8 @@ struct llm_graph_context {
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
+                   bool   keep_history = false) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

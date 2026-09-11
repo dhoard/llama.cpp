@@ -28,6 +28,8 @@ RUN LLAMA_BUILD_NUMBER="$APP_VERSION" npm run build
 ### Build image
 FROM ${BASE_ROCM_DEV_CONTAINER} AS build
 
+ARG LLAMA_BUILD_TESTS=OFF
+
 # Unless otherwise specified, we make a fat build.
 # This is mostly tied to rocBLAS supported archs.
 # check https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.1/reference/system-requirements.html
@@ -59,7 +61,7 @@ RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
         -DGGML_HIP=ON \
         -DAMDGPU_TARGETS="$ROCM_DOCKER_ARCH" \
         -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
-        -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF \
+        -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=${LLAMA_BUILD_TESTS} \
     && cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib \
@@ -144,3 +146,13 @@ WORKDIR /app
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 
 ENTRYPOINT [ "/app/llama-server" ]
+
+### Development and test image
+FROM base AS dev
+
+COPY --from=build /app/build /app/build
+COPY --from=build /app/full /app/full
+
+WORKDIR /app
+
+ENTRYPOINT [ "/bin/bash" ]

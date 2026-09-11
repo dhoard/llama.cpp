@@ -2745,6 +2745,11 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
+    const char * gdn_opt = getenv("GGML_HIP_ORNITH_GDN_OPT");
+    if (gdn_opt != nullptr && std::atoi(gdn_opt) == 0) {
+        return 0;
+    }
+
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
     if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
