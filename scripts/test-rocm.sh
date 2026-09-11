@@ -5,8 +5,9 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 DOCKER=${DOCKER:-docker}
-IMAGE=${IMAGE:-local/llama.cpp:ornith-rocm-dev}
+IMAGE=${IMAGE:-local/llama.cpp:mtp-dev}
 HF_CACHE=${HF_CACHE:-${HOME}/.cache/huggingface}
+MODEL=${MODEL:-ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M}
 ROCM_DOCKER_ARCH=${ROCM_DOCKER_ARCH:-gfx1101}
 BUILD_TEST_IMAGE=${BUILD_TEST_IMAGE:-1}
 BACKEND_OPS=${BACKEND_OPS:-MUL_MAT,FLASH_ATTN_EXT}
@@ -20,7 +21,7 @@ if [[ "$BUILD_TEST_IMAGE" == 1 ]]; then
     TARGET=dev \
     LLAMA_BUILD_TESTS=ON \
     ROCM_DOCKER_ARCH="$ROCM_DOCKER_ARCH" \
-    "$ROOT_DIR/scripts/build-ornith-rocm.sh"
+    "$ROOT_DIR/scripts/build-image.sh"
 fi
 
 "$DOCKER" run --rm \
@@ -52,10 +53,12 @@ for test_name in test-llama-archs; do
 done
 '
 
-model_file=$(find -L "$HF_CACHE/hub/models--ornith-ai--Ornith-1.5-9B-GGUF" \
+model_repo=${MODEL%%:*}
+model_dir=${model_repo//\//--}
+model_file=$(find -L "$HF_CACHE/hub/models--$model_dir" \
     -type f -name '*.gguf' -print -quit 2>/dev/null || true)
 if [[ -z "$model_file" ]]; then
-    echo "No cached Ornith GGUF found; skipping server smoke test"
+    echo "No cached GGUF found for $MODEL; skipping server smoke test"
     exit 0
 fi
 
@@ -77,7 +80,7 @@ if [[ "$RUN_RECURRENT_ROLLBACK" != 0 ]] && "$DOCKER" run --rm --pull=never "$IMA
         -ub 128
 fi
 
-container_name=${CONTAINER_NAME:-ornith-rocm-test}
+container_name=${CONTAINER_NAME:-rocm-test}
 port=${PORT:-18000}
 cleanup() {
     "$DOCKER" rm -f "$container_name" >/dev/null 2>&1 || true
@@ -93,7 +96,7 @@ trap cleanup EXIT
     -v "$HF_CACHE:/root/.cache/huggingface" \
     --entrypoint /app/full/llama-server \
     "$IMAGE" \
-    -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M \
+    -hf "$MODEL" \
     --no-mmproj \
     --host 0.0.0.0 \
     --port 8000 \

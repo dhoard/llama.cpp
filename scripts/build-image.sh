@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 DOCKER=${DOCKER:-docker}
-IMAGE=${IMAGE:-local/llama.cpp:ornith-rocm}
+IMAGE=${IMAGE:-local/llama.cpp:mtp}
 TARGET=${TARGET:-server}
 ROCM_DOCKER_ARCH=${ROCM_DOCKER_ARCH:-gfx1101}
 LLAMA_BUILD_TESTS=${LLAMA_BUILD_TESTS:-OFF}

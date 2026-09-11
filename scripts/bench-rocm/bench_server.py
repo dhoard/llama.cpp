@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure llama-server prompt and decode throughput for Ornith."""
+"""Measure llama-server prompt and decode throughput on ROCm."""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ import urllib.request
 from pathlib import Path
 
 
-UNIT = "Ornith ROCm benchmark line {index}: compare the stable response path. "
+UNIT = "ROCm benchmark line {index}: compare the stable response path. "
 
 
 def request_json(url, payload, timeout):

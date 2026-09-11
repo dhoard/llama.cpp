@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 DOCKER=${DOCKER:-docker}
-IMAGE=${IMAGE:-local/llama.cpp:ornith-rocm}
+IMAGE=${IMAGE:-local/llama.cpp:mtp}
 PORT=${PORT:-8000}
 HF_CACHE=${HF_CACHE:-${HOME}/.cache/huggingface}
 MODEL=${MODEL:-ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M}
@@ -22,16 +22,16 @@ REASONING_BUDGET=${REASONING_BUDGET:-8192}
 MTP_N_MAX=${MTP_N_MAX:-3}
 GDN_OPT=${GDN_OPT:-1}
 SPARSE_ATTN_MODE=${SPARSE_ATTN_MODE:-off}
-ORNITH_OPTIMIZED=${ORNITH_OPTIMIZED:-1}
+OPTIMIZED=${OPTIMIZED:-1}
 
-if [[ "$ORNITH_OPTIMIZED" == 0 ]]; then
+if [[ "$OPTIMIZED" == 0 ]]; then
     GDN_OPT=0
     MTP_N_MAX=0
     SPARSE_ATTN_MODE=off
 fi
 
 if [[ "$SPARSE_ATTN_MODE" != off ]]; then
-    echo "error: sparse attention is not implemented for Qwen3.5/Ornith in this checkout" >&2
+    echo "error: sparse attention is not implemented for Qwen3.5 in this checkout" >&2
     echo "       use SPARSE_ATTN_MODE=off" >&2
     exit 2
 fi
@@ -57,7 +57,7 @@ if [[ -n ${HF_TOKEN:-} ]]; then
     docker_args+=(--env HF_TOKEN)
 fi
 if [[ "$GDN_OPT" == 0 ]]; then
-    docker_args+=(--env GGML_HIP_ORNITH_GDN_OPT=0)
+    docker_args+=(--env GGML_HIP_GDN_OPT=0)
 fi
 
 server_args=(

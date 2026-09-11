@@ -1,15 +1,14 @@
-# Ornith 1.5 ROCm optimization
+# ROCm MTP optimization
 
-This checkout keeps the original Ornith-1.5-9B GGUF unchanged and packages the
-existing llama.cpp Qwen3.5 execution path for Docker-only ROCm use. The work
-reuses the current HIP Gated DeltaNet cache fusion and quantized FlashAttention
-implementation. It adds reproducible image, test, run, and benchmark entry
-points around that path.
+This checkout packages the existing llama.cpp Qwen3.5 execution path for
+Docker-only ROCm use. The work reuses the current HIP Gated DeltaNet cache
+fusion and quantized FlashAttention implementation. It adds reproducible
+image, test, run, and benchmark entry points around that path.
 
 The implementation was audited from source revision `41fc7584`. The initial
 machine was an RX 7700 XT (`gfx1101`) with ROCm 7.2.1 supplied by the
-repository Dockerfile. The tested model file was
-`Ornith-1.5-9B-Q4_K_M.gguf`.
+repository Dockerfile. The tested model was a Qwen3.5-based 9B GGUF in
+Q4_K_M.
 
 ## Build
 
@@ -17,14 +16,14 @@ The host only needs Docker, access to `/dev/kfd` and `/dev/dri`, and the
 model cache. ROCm compilation and tests run inside the image.
 
 ```sh
-ROCM_DOCKER_ARCH=gfx1101 ./scripts/build-ornith-rocm.sh
+ROCM_DOCKER_ARCH=gfx1101 ./scripts/build-image.sh
 ```
 
 The default target is `server`. Set `TARGET=dev` and
 `LLAMA_BUILD_TESTS=ON` when building the development image:
 
 ```sh
-TARGET=dev LLAMA_BUILD_TESTS=ON ./scripts/build-ornith-rocm.sh
+TARGET=dev LLAMA_BUILD_TESTS=ON ./scripts/build-image.sh
 ```
 
 The script records the source revision in the image labels and uses the
@@ -36,25 +35,25 @@ Dockerfile ROCm version when needed.
 The normal launch uses the same settings used for the baseline comparison:
 
 ```sh
-./scripts/run-ornith-9b-rocm.sh
+./scripts/run-rocm.sh
 ```
 
 The wrapper uses the local image
-`local/llama.cpp:ornith-rocm`, mounts
+`local/llama.cpp:mtp`, mounts
 `${HOME}/.cache/huggingface`, enables all model layers on the GPU, enables
 FlashAttention, uses Q4 K/V cache, and starts with a 262144 token context.
 
 Useful overrides are:
 
 ```sh
-PORT=8001 CTX=32768 ./scripts/run-ornith-9b-rocm.sh
-MTP_N_MAX=0 ./scripts/run-ornith-9b-rocm.sh
-GDN_OPT=0 ./scripts/run-ornith-9b-rocm.sh
+PORT=8001 CTX=32768 ./scripts/run-rocm.sh
+MTP_N_MAX=0 ./scripts/run-rocm.sh
+GDN_OPT=0 ./scripts/run-rocm.sh
 ```
 
-`GDN_OPT=0` passes `GGML_HIP_ORNITH_GDN_OPT=0` into the container and disables the GDN cache fusion A/B path. MTP defaults to three draft tokens after the rollback fix described below; `MTP_N_MAX=0` disables it. The default batch and ubatch sizes are both 512. `SPARSE_ATTN_MODE` accepts only `off`; other values fail closed because this checkout has no validated Qwen3.5 sparse attention path.
+`GDN_OPT=0` passes `GGML_HIP_GDN_OPT=0` into the container and disables the GDN cache fusion A/B path. MTP defaults to three draft tokens after the rollback fix described below; `MTP_N_MAX=0` disables it. The default batch and ubatch sizes are both 512. `SPARSE_ATTN_MODE` accepts only `off`; other values fail closed because this checkout has no validated Qwen3.5 sparse attention path.
 
-Set `ORNITH_OPTIMIZED=0` to force the safe baseline wrapper settings. This
+Set `OPTIMIZED=0` to force the safe baseline wrapper settings. This
 also disables GDN fusion, MTP, and sparse mode.
 
 ## Tests
@@ -63,7 +62,7 @@ Build and run the generic tests and a model smoke test in the ROCm development
 container:
 
 ```sh
-./scripts/test-ornith-rocm.sh
+./scripts/test-rocm.sh
 ```
 
 The script runs the existing `test-backend-ops` and `test-llama-archs` binaries when they are present, then starts the cached GGUF with a small context and checks health plus a generated completion. It also runs `test-recurrent-state-rollback` against the cached model by default; `RUN_RECURRENT_ROLLBACK=0` skips that check. The rollback test now passes on CPU and ROCm. No new test source files were added.
@@ -72,7 +71,7 @@ The script runs the existing `test-backend-ops` and `test-llama-archs` binaries 
 
 Short decodes previously overwrote old convolution snapshots and left old GDN snapshots in the wrong slots. DeltaNet state loading now gathers the required history before cache writes, advances that history by the number of decoded tokens, and preserves snapshots for idle sequences when cache cells move. Checkpoint restore records the oldest available position so rollback cannot read history that was not restored.
 
-The existing rollback test failed on Ornith with a maximum logit difference of 2.09621. After the fix, split replay, idle-sequence independence, and rollback after cache-cell movement all match the reference exactly, with both zero-filled and deliberately nonzero cache buffers. These checks passed on CPU and ROCm, including Q4 K/V caches on ROCm.
+The existing rollback test failed on the test model with a maximum logit difference of 2.09621. After the fix, split replay, idle-sequence independence, and rollback after cache-cell movement all match the reference exactly, with both zero-filled and deliberately nonzero cache buffers. These checks passed on CPU and ROCm, including Q4 K/V caches on ROCm.
 
 With the RX 7700 XT, a 262144-token context allocation, Q4 K/V caches, batch/ubatch 512, and eight threads, three short prompts generating 128 tokens measured 82.6, 87.3, and 98.7 tokens/s with MTP. The baseline measured approximately 56.7 tokens/s. These are short-prompt measurements, not throughput at a filled 262K context. A repeated prompt after unrelated requests produced the same tokens and draft acceptance counts.
 
@@ -88,18 +87,18 @@ source revision, server arguments, prompt token count, raw repetitions, and
 medians:
 
 ```sh
-./scripts/ornith/bench-rocm.sh
+./scripts/bench-rocm/bench-rocm.sh
 ```
 
 A shorter validation run is:
 
 ```sh
-CONTEXTS=8192,32768 REPETITIONS=1 WARMUPS=0 N_PREDICT=32 \\
-    ./scripts/ornith/bench-rocm.sh
+CONTEXTS=8192,32768 REPETITIONS=1 WARMUPS=0 N_PREDICT=32 \
+    ./scripts/bench-rocm/bench-rocm.sh
 ```
 
 Results are written to
-`benchmarks/ornith-rocm/results.json`, which is ignored by Git. The default
+`benchmarks/rocm/results.json`, which is ignored by Git. The default
 sweep uses 8K, 32K, 64K, 128K, 192K, and 256K requested context budgets, with
 256 generated tokens reserved in each request. Each prompt is generated and
 tokenized through the running server, then completed with
@@ -151,7 +150,7 @@ local-image results are within measurement noise, so this checkout does not
 claim a throughput gain from the existing GDN fusion path.
 
 Direct `llama-bench` tuning for the RX 7700 XT used the development image
-`local/llama.cpp:ornith-rocm-bench`, `ROCm0`, Q4 K/V cache, FlashAttention,
+`local/llama.cpp:rocm-bench`, `ROCm0`, Q4 K/V cache, FlashAttention,
 8 CPU threads, and two repetitions per setting. At an 8K prompt, batch `512`
 with ubatch `512` measured 1647 prompt tokens/s and 56.4 generated tokens/s;
 batch `2048` measured 1560 prompt tokens/s and 56.5 generated tokens/s. At a

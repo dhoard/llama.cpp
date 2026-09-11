@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 
 DOCKER=${DOCKER:-docker}
-IMAGE=${IMAGE:-local/llama.cpp:ornith-rocm}
+IMAGE=${IMAGE:-local/llama.cpp:mtp}
 HF_CACHE=${HF_CACHE:-${HOME}/.cache/huggingface}
 MODEL=${MODEL:-ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M}
 PORT=${PORT:-18080}
@@ -27,11 +27,11 @@ REPETITIONS=${REPETITIONS:-3}
 WARMUPS=${WARMUPS:-1}
 N_PREDICT=${N_PREDICT:-256}
 TIMEOUT=${TIMEOUT:-1800}
-OUTPUT=${OUTPUT:-benchmarks/ornith-rocm/results.json}
-CONTAINER_NAME=${CONTAINER_NAME:-ornith-rocm-bench}
+OUTPUT=${OUTPUT:-benchmarks/rocm/results.json}
+CONTAINER_NAME=${CONTAINER_NAME:-rocm-bench}
 
 if [[ "$SPARSE_ATTN_MODE" != off ]]; then
-    echo "error: sparse attention is not implemented for Qwen3.5/Ornith in this checkout" >&2
+    echo "error: sparse attention is not implemented for Qwen3.5 in this checkout" >&2
     exit 2
 fi
 
@@ -97,7 +97,7 @@ if [[ -n ${HF_TOKEN:-} ]]; then
     docker_args+=(--env HF_TOKEN)
 fi
 if [[ "$GDN_OPT" == 0 ]]; then
-    docker_args+=(--env GGML_HIP_ORNITH_GDN_OPT=0)
+    docker_args+=(--env GGML_HIP_GDN_OPT=0)
 fi
 
 docker_args+=(
@@ -137,7 +137,7 @@ for attempt in $(seq 1 120); do
     sleep 2
 done
 
-python3 "$ROOT_DIR/scripts/ornith/bench_server.py" \
+python3 "$ROOT_DIR/scripts/bench-rocm/bench_server.py" \
     --url "http://127.0.0.1:$PORT" \
     --contexts "$CONTEXTS" \
     --repetitions "$REPETITIONS" \
