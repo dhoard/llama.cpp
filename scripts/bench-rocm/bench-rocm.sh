@@ -16,6 +16,12 @@ BATCH=${BATCH:-2048}
 UBATCH=${UBATCH:-512}
 THREADS=${THREADS:-8}
 THREADS_BATCH=${THREADS_BATCH:-8}
+HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
+N_GPU_LAYERS=${N_GPU_LAYERS:-all}
+FIT=${FIT:-off}
+FIT_TARGET=${FIT_TARGET:-1024}
+FIT_CTX=${FIT_CTX:-4096}
+LOAD_MODE=${LOAD_MODE:-}
 CACHE_TYPE_K=${CACHE_TYPE_K:-q4_0}
 CACHE_TYPE_V=${CACHE_TYPE_V:-q4_0}
 CACHE_REUSE=${CACHE_REUSE:-1024}
@@ -45,7 +51,11 @@ cd "$ROOT_DIR"
 
 commit=$(git rev-parse HEAD)
 image_id=$("$DOCKER" image inspect --format '{{.Id}}' "$IMAGE")
-metadata=$(python3 - "$IMAGE" "$image_id" "$commit" "$MODEL" "$CTX" "$PARALLEL" "$BATCH" "$UBATCH" "$THREADS" "$THREADS_BATCH" "$CACHE_TYPE_K" "$CACHE_TYPE_V" "$CACHE_REUSE" "$REASONING_BUDGET" "$MTP_N_MAX" "$GDN_OPT" "$SPARSE_ATTN_MODE" "$REPETITIONS" "$WARMUPS" "$N_PREDICT" "${GGML_HIP_FA_DEBUG:-}" "${GGML_HIP_FA_Q4_MTP_VEC:-}" <<'PY'
+metadata_n_gpu_layers=$N_GPU_LAYERS
+if [[ "$FIT" == on ]]; then
+    metadata_n_gpu_layers=auto
+fi
+metadata=$(python3 - "$IMAGE" "$image_id" "$commit" "$MODEL" "$CTX" "$PARALLEL" "$BATCH" "$UBATCH" "$THREADS" "$THREADS_BATCH" "$HIP_VISIBLE_DEVICES" "$metadata_n_gpu_layers" "$FIT" "$FIT_TARGET" "$FIT_CTX" "${LOAD_MODE:-default}" "$CACHE_TYPE_K" "$CACHE_TYPE_V" "$CACHE_REUSE" "$REASONING_BUDGET" "$MTP_N_MAX" "$GDN_OPT" "$SPARSE_ATTN_MODE" "$REPETITIONS" "$WARMUPS" "$N_PREDICT" "${GGML_HIP_FA_DEBUG:-}" "${GGML_HIP_FA_Q4_MTP_VEC:-}" <<'PY'
 import json
 import sys
 
@@ -60,6 +70,12 @@ keys = (
     "ubatch",
     "threads",
     "threads_batch",
+    "hip_visible_devices",
+    "n_gpu_layers",
+    "fit",
+    "fit_target",
+    "fit_ctx",
+    "load_mode",
     "cache_type_k",
     "cache_type_v",
     "cache_reuse",
@@ -75,8 +91,12 @@ keys = (
 )
 values = sys.argv[1:]
 data = dict(zip(keys, values))
-for key in ("ctx", "parallel", "batch", "ubatch", "threads", "threads_batch", "reasoning_budget", "mtp_n_max", "repetitions", "warmups", "n_predict"):
+for key in ("ctx", "parallel", "batch", "ubatch", "threads", "threads_batch", "fit_ctx", "reasoning_budget", "mtp_n_max", "repetitions", "warmups", "n_predict"):
     data[key] = int(data[key])
+if data["n_gpu_layers"].isdigit():
+    data["n_gpu_layers"] = int(data["n_gpu_layers"])
+if data["fit_target"].isdigit():
+    data["fit_target"] = int(data["fit_target"])
 print(json.dumps(data))
 PY
 )
@@ -91,7 +111,9 @@ docker_args=(
     --device=/dev/kfd
     --device=/dev/dri
     --group-add video
+    --group-add render
     --ipc=host
+    --env "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"
     -p "$PORT:8000"
     -v "$HF_CACHE:/root/.cache/huggingface"
 )
@@ -116,7 +138,6 @@ docker_args+=(
     --port 8000
     -c "$CTX"
     -np "$PARALLEL"
-    -ngl all
     -fa on
     -b "$BATCH"
     -ub "$UBATCH"
@@ -127,6 +148,14 @@ docker_args+=(
     --cache-reuse "$CACHE_REUSE"
     --reasoning-budget "$REASONING_BUDGET"
 )
+if [[ "$FIT" == on ]]; then
+    docker_args+=(--fit on --fit-target "$FIT_TARGET" --fit-ctx "$FIT_CTX")
+else
+    docker_args+=(-ngl "$N_GPU_LAYERS")
+fi
+if [[ -n "$LOAD_MODE" ]]; then
+    docker_args+=(--load-mode "$LOAD_MODE")
+fi
 if (( MTP_N_MAX > 0 )); then
     docker_args+=(--spec-type draft-mtp --spec-draft-n-max "$MTP_N_MAX")
 fi
@@ -145,6 +174,29 @@ for attempt in $(seq 1 120); do
     sleep 2
 done
 
+bench_server_args=(
+    "--server-arg=-c=$CTX"
+    "--server-arg=-b=$BATCH"
+    "--server-arg=-ub=$UBATCH"
+    "--server-arg=--cache-type-k=$CACHE_TYPE_K"
+    "--server-arg=--cache-type-v=$CACHE_TYPE_V"
+    "--server-arg=--cache-reuse=$CACHE_REUSE"
+    "--server-arg=--reasoning-budget=$REASONING_BUDGET"
+    "--server-arg=--mtp-n-max=$MTP_N_MAX"
+)
+if [[ "$FIT" == on ]]; then
+    bench_server_args+=(
+        "--server-arg=--fit=on"
+        "--server-arg=--fit-target=$FIT_TARGET"
+        "--server-arg=--fit-ctx=$FIT_CTX"
+    )
+else
+    bench_server_args+=("--server-arg=-ngl=$N_GPU_LAYERS")
+fi
+if [[ -n "$LOAD_MODE" ]]; then
+    bench_server_args+=("--server-arg=--load-mode=$LOAD_MODE")
+fi
+
 python3 "$ROOT_DIR/scripts/bench-rocm/bench_server.py" \
     --url "http://127.0.0.1:$PORT" \
     --contexts "$CONTEXTS" \
@@ -153,12 +205,5 @@ python3 "$ROOT_DIR/scripts/bench-rocm/bench_server.py" \
     --n-predict "$N_PREDICT" \
     --timeout "$TIMEOUT" \
     --metadata "$metadata" \
-    "--server-arg=-c=$CTX" \
-    "--server-arg=-b=$BATCH" \
-    "--server-arg=-ub=$UBATCH" \
-    "--server-arg=--cache-type-k=$CACHE_TYPE_K" \
-    "--server-arg=--cache-type-v=$CACHE_TYPE_V" \
-    "--server-arg=--cache-reuse=$CACHE_REUSE" \
-    "--server-arg=--reasoning-budget=$REASONING_BUDGET" \
-    "--server-arg=--mtp-n-max=$MTP_N_MAX" \
+    "${bench_server_args[@]}" \
     --output "$ROOT_DIR/$OUTPUT"

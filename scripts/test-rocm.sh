@@ -9,6 +9,7 @@ IMAGE=${IMAGE:-local/llama.cpp:mtp-dev}
 HF_CACHE=${HF_CACHE:-${HOME}/.cache/huggingface}
 MODEL=${MODEL:-ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M}
 ROCM_DOCKER_ARCH=${ROCM_DOCKER_ARCH:-gfx1101}
+HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
 BUILD_TEST_IMAGE=${BUILD_TEST_IMAGE:-1}
 BACKEND_OPS=${BACKEND_OPS:-MUL_MAT,FLASH_ATTN_EXT}
 BACKEND_TEST_MODE=${BACKEND_TEST_MODE:-support}
@@ -28,7 +29,9 @@ fi
     --device=/dev/kfd \
     --device=/dev/dri \
     --group-add video \
+    --group-add render \
     --ipc=host \
+    --env "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES" \
     --env "BACKEND_OPS=$BACKEND_OPS" \
     --env "BACKEND_TEST_MODE=$BACKEND_TEST_MODE" \
     "$IMAGE" \
@@ -69,7 +72,9 @@ if [[ "$RUN_RECURRENT_ROLLBACK" != 0 ]] && "$DOCKER" run --rm --pull=never "$IMA
         --device=/dev/kfd \
         --device=/dev/dri \
         --group-add video \
+        --group-add render \
         --ipc=host \
+        --env "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES" \
         -v "$HF_CACHE:/root/.cache/huggingface" \
         --entrypoint /app/build/bin/test-recurrent-state-rollback \
         "$IMAGE" \
@@ -91,7 +96,9 @@ trap cleanup EXIT
     --device=/dev/kfd \
     --device=/dev/dri \
     --group-add video \
+    --group-add render \
     --ipc=host \
+    --env "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES" \
     -p "$port:8000" \
     -v "$HF_CACHE:/root/.cache/huggingface" \
     --entrypoint /app/full/llama-server \

@@ -5,10 +5,12 @@ Docker-only ROCm use. The work reuses the current HIP Gated DeltaNet cache
 fusion and quantized FlashAttention implementation. It adds reproducible
 image, test, run, and benchmark entry points around that path.
 
-The implementation was audited from source revision `41fc7584`. The initial
-machine was an RX 7700 XT (`gfx1101`) with ROCm 7.2.1 supplied by the
-repository Dockerfile. The tested model was a Qwen3.5-based 9B GGUF in
-Q4_K_M.
+The implementation was audited from starting revision
+`b92f62d94f2a8ea3023d39cbcd264018c3624eda`. The machine was an RX 7700 XT
+(`gfx1101`) with ROCm 7.2.1 supplied by the repository Dockerfile. The target
+model was `ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M`. The cached 9B model is
+used only by the focused rollback smoke test because the 35B model does not
+fit in the test context configuration.
 
 ## Build
 
@@ -38,10 +40,11 @@ The normal launch uses the same settings used for the baseline comparison:
 ./scripts/run-rocm.sh
 ```
 
-The wrapper uses the local image
-`local/llama.cpp:mtp`, mounts
-`${HOME}/.cache/huggingface`, enables all model layers on the GPU, enables
-FlashAttention, uses Q4 K/V cache, and starts with a 262144 token context.
+The wrapper uses the local image `local/llama.cpp:mtp`, mounts
+`${HOME}/.cache/huggingface`, enables FlashAttention, uses Q4 K/V cache, and
+starts with a 262144 token context. ROCm containers default to
+`HIP_VISIBLE_DEVICES=0`, and add the `render` group so the integrated GPU is
+not visible to HIP.
 
 Useful overrides are:
 
@@ -51,7 +54,7 @@ MTP_N_MAX=0 ./scripts/run-rocm.sh
 GDN_OPT=0 ./scripts/run-rocm.sh
 ```
 
-`GDN_OPT=0` passes `GGML_HIP_GDN_OPT=0` into the container and disables the GDN cache fusion A/B path. MTP defaults to three draft tokens after the rollback fix described below; `MTP_N_MAX=0` disables it. The default batch and ubatch sizes are both 512. `SPARSE_ATTN_MODE` accepts only `off`; other values fail closed because this checkout has no validated Qwen3.5 sparse attention path.
+`GDN_OPT=0` passes `GGML_HIP_GDN_OPT=0` into the container and disables the GDN cache fusion A/B path. MTP defaults to three draft tokens after the rollback fix described below; `MTP_N_MAX=0` disables it. `FIT=on` selects automatic partial offload, with `FIT_TARGET` and `FIT_CTX` controlling the fit pass. Otherwise `N_GPU_LAYERS` selects the offload depth. `LOAD_MODE` is passed through when set. `SPARSE_ATTN_MODE` accepts only `off`; other values fail closed because this checkout has no validated Qwen3.5 sparse attention path.
 
 Set `OPTIMIZED=0` to force the safe baseline wrapper settings. This
 also disables GDN fusion, MTP, and sparse mode.
@@ -65,7 +68,7 @@ container:
 ./scripts/test-rocm.sh
 ```
 
-The script runs the existing `test-backend-ops` and `test-llama-archs` binaries when they are present, then starts the cached GGUF with a small context and checks health plus a generated completion. It also runs `test-recurrent-state-rollback` against the cached model by default; `RUN_RECURRENT_ROLLBACK=0` skips that check. The rollback test now passes on CPU and ROCm. No new test source files were added.
+The script runs the existing `test-backend-ops` and `test-llama-archs` binaries when they are present, then starts the cached GGUF with a small context and checks health plus a generated completion. It also runs `test-recurrent-state-rollback` against the cached model by default; `RUN_RECURRENT_ROLLBACK=0` skips that check. The focused rollback test was extended in this checkout and passes on CPU and ROCm. No new test file was added.
 
 ## MTP rollback fix and validation
 
@@ -239,3 +242,79 @@ The 64K prompt measurement completed at 907.8 prompt tokens/s. The 128K
 measurement was stopped after several minutes without completing. The current
 evidence does not justify adding a second HIP GDN implementation, so no
 chunked kernel was added.
+
+## Final target implementation and validation
+
+The retained HIP GDN change uses a row-per-warp layout. Four warps process a
+16-column value tile, and each warp updates four state rows while lanes shard
+the key dimension. For the target `S_v=128` shape this reduces the launch grid
+from 32 state-column blocks to 8 value-tile blocks per head. Scalar gates and
+vector KDA gates use the same layout, while the scalar path remains the path
+used by the target model. Snapshot slot mapping and fused cache writes are
+unchanged.
+
+Recurrent cache cleanup now clears every snapshot plane for cells discarded by
+`seq_keep`. Non-unified attention caches also reset the other sequence streams;
+this prevents stale attention cells when a sequence id is reused. The existing
+rollback test covers zero and nonzero cache fills, split replay, cache-cell
+movement, aliases, and repeated sequence ids.
+
+Focused validation used ROCm device 0 only:
+
+```sh
+HIP_VISIBLE_DEVICES=0 docker run --rm --pull=never \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video --group-add render --ipc=host \
+    -e HIP_VISIBLE_DEVICES=0 \
+    local/llama.cpp:gd-row-dev-final \
+    /app/build/bin/test-backend-ops -b ROCm0 -o GATED_DELTA_NET
+```
+
+The GDN operator suite passed 36/36 cases, including scalar and KDA gates,
+one-token decode, multi-token prefill, multiple sequences, and head sizes up
+to 128. The recurrent rollback test passed for both cache fills. MTP accepted
+20/20 draft tokens at 8K and 20/21 at 32K in the target run.
+
+The exact target benchmark used the 35B Q4_K_M model, ROCm 7.2.1, RX 7700 XT
+gfx1101, automatic fit with target 4096, context capacity 262144, batch 256,
+ubatch 128, Turbo4 K/V cache, eight threads, MTP_N_MAX=2, reasoning budget
+1024, and `HIP_VISIBLE_DEVICES=0`:
+
+```sh
+HIP_VISIBLE_DEVICES=0 \
+IMAGE=local/llama.cpp:gd-row-server-final \
+MODEL=ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M \
+FIT=on FIT_TARGET=4096 FIT_CTX=4096 LOAD_MODE=none \
+CTX=262144 BATCH=256 UBATCH=128 THREADS=8 THREADS_BATCH=8 \
+CACHE_TYPE_K=turbo4 CACHE_TYPE_V=turbo4 MTP_N_MAX=2 \
+GDN_OPT=1 REASONING_BUDGET=1024 \
+CONTEXTS=8192,32768 REPETITIONS=3 WARMUPS=1 N_PREDICT=32 \
+PORT=18089 OUTPUT=benchmarks/rocm/gd-target-row-run-script-r1024.json \
+./scripts/bench-rocm/bench-rocm.sh
+```
+
+The raw JSON files are ignored by Git and record the image id, source
+revision, device visibility, server arguments, per-run timings, and MTP
+acceptance counts. The same-session baseline used
+`local/llama.cpp:gd-baseline-server` with the same command-line settings.
+
+| Requested prompt | Metric | Baseline median | Row-per-warp median | Delta |
+| ---: | --- | ---: | ---: | ---: |
+| 8K | prompt tok/s | 290.96 | 288.60 | -0.81% |
+| 8K | decode tok/s | 44.82 | 45.29 | +1.03% |
+| 32K | prompt tok/s | 257.57 | 257.58 | +0.00% |
+| 32K | decode tok/s | 39.48 | 39.47 | -0.02% |
+
+The end-to-end differences are within the observed run-to-run variation, so
+this change is not claimed as an application-level throughput win. The kernel
+reduces GDN launch and state-tile work by construction; the target workload is
+dominated by the rest of the hybrid model and Turbo4 full-attention path.
+The benchmark did not emit a separate max-error value; correctness is reported
+by the existing backend comparator and all 36 GDN cases passed.
+
+No chunked HIP GDN kernel or new sparse-attention path was retained. The
+NVIDIA-oriented FlashQLA and upstream chunked designs were treated as design
+references, not runtime dependencies or direct HIP ports. If cache fusion is
+unstable on another HIP target, `GDN_OPT=0` remains the fallback. Long-context
+64K and larger target measurements remain the next profiling task, and the
+Turbo4 full-attention path is the next likely optimization target.

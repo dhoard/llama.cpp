@@ -563,8 +563,19 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    const uint32_t stream_id = seq_to_stream[seq_id];
+
+    // Non-unified caches keep each sequence in its own stream. Keeping one
+    // sequence must discard the cells in all other streams as well.
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (s != stream_id) {
+            v_cells[s].reset();
+            v_heads[s] = 0;
+        }
+    }
+
+    auto & cells = v_cells[stream_id];
+    auto & head  = v_heads[stream_id];
 
     uint32_t new_head = cells.size();
 

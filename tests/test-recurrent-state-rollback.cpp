@@ -311,14 +311,14 @@ static bool test_seq_alias_rollback(const common_params & params, llama_model * 
     constexpr llama_pos dst_p0         = n_prompt - dst_rollback;
     constexpr float     eps            = 1e-5f;
 
-    const auto make_ctx_alias = [&]() {
+    const auto make_ctx_alias = [&](bool kv_unified = false) {
         auto cparams = common_context_params_to_llama(params);
         cparams.n_seq_max  = 2;
         cparams.n_rs_seq   = 8;
         cparams.n_ctx      = 256;
         cparams.n_batch    = 256;
         cparams.n_ubatch   = 64;
-        cparams.kv_unified = false;
+        cparams.kv_unified = kv_unified;
         return init_ctx(model, cparams, fill);
     };
 
@@ -418,8 +418,8 @@ static bool test_seq_alias_rollback(const common_params & params, llama_model * 
     // first seq_id in the batch owns the source state even when it is not the
     // lowest numerical id. Both aliases must consume the same rollback index.
     {
-        llama_context * ctx = make_ctx_alias();
-        llama_context * ref = make_ctx_alias();
+        llama_context * ctx = make_ctx_alias(true);
+        llama_context * ref = make_ctx_alias(true);
         if (ctx == nullptr || ref == nullptr) {
             if (ctx != nullptr) llama_free(ctx);
             if (ref != nullptr) llama_free(ref);
@@ -433,7 +433,7 @@ static bool test_seq_alias_rollback(const common_params & params, llama_model * 
             decode_range(ctx, 0, 1, 0, n_prompt) &&
             llama_memory_seq_rm(llama_get_memory(ctx), 1, src_p0, -1) &&
             llama_memory_seq_rm(llama_get_memory(ref), 1, src_p0, -1) &&
-            llama_memory_seq_rm(llama_get_memory(ctx), 0, dst_p0, -1);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, src_p0, -1);
 
         if (ok) {
             // primary=1 deliberately sorts after secondary=0 in std::set.

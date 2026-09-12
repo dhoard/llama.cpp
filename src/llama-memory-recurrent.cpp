@@ -312,6 +312,22 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
         }
 
         if (!cells[i].has_seq_id(seq_id)) {
+            const auto clear_rows = [&](const std::vector<ggml_tensor *> & tensors) {
+                for (ggml_tensor * tensor : tensors) {
+                    if (tensor == nullptr) {
+                        continue;
+                    }
+
+                    for (uint32_t plane = 0; plane <= n_rs_seq; ++plane) {
+                        const size_t row = (size_t) plane * size + i;
+                        ggml_backend_tensor_memset(tensor, 0, row * tensor->nb[1], tensor->nb[1]);
+                    }
+                }
+            };
+
+            clear_rows(r_l);
+            clear_rows(s_l);
+            clear_rows(p_l);
             if (cells[i].pos >= 0) {
                 used--;
             }

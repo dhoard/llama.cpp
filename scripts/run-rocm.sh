@@ -15,6 +15,12 @@ BATCH=${BATCH:-512}
 UBATCH=${UBATCH:-512}
 THREADS=${THREADS:-8}
 THREADS_BATCH=${THREADS_BATCH:-8}
+HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
+N_GPU_LAYERS=${N_GPU_LAYERS:-all}
+FIT=${FIT:-off}
+FIT_TARGET=${FIT_TARGET:-1024}
+FIT_CTX=${FIT_CTX:-4096}
+LOAD_MODE=${LOAD_MODE:-}
 CACHE_TYPE_K=${CACHE_TYPE_K:-q4_0}
 CACHE_TYPE_V=${CACHE_TYPE_V:-q4_0}
 CACHE_REUSE=${CACHE_REUSE:-1024}
@@ -48,7 +54,9 @@ docker_args=(
     --device=/dev/kfd
     --device=/dev/dri
     --group-add video
+    --group-add render
     --ipc=host
+    --env "HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES"
     -p "$PORT:$PORT"
     -v "$HF_CACHE:/root/.cache/huggingface"
 )
@@ -73,7 +81,6 @@ server_args=(
     --port "$PORT"
     -c "$CTX"
     -np "$PARALLEL"
-    -ngl all
     -fa on
     -b "$BATCH"
     -ub "$UBATCH"
@@ -84,6 +91,15 @@ server_args=(
     --cache-reuse "$CACHE_REUSE"
     --reasoning-budget "$REASONING_BUDGET"
 )
+
+if [[ "$FIT" == on ]]; then
+    server_args+=(--fit on --fit-target "$FIT_TARGET" --fit-ctx "$FIT_CTX")
+else
+    server_args+=(-ngl "$N_GPU_LAYERS")
+fi
+if [[ -n "$LOAD_MODE" ]]; then
+    server_args+=(--load-mode "$LOAD_MODE")
+fi
 
 if (( MTP_N_MAX > 0 )); then
     server_args+=(--spec-type draft-mtp --spec-draft-n-max "$MTP_N_MAX")
