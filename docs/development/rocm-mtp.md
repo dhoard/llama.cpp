@@ -184,3 +184,58 @@ FlashAttention path. GDN recurrent state remains in its existing format.
 The benchmark JSON is the performance record for the exact image and revision.
 Long-context results should be collected on the target GPU before changing
 the default batch, context, cache, or MTP settings.
+
+## FlashAttention dispatch experiment
+
+The HIP FlashAttention selector keeps the existing default behavior for quantized
+K/V caches. Set `GGML_HIP_FA_DEBUG=1` to log the first 32 HIP FlashAttention
+dispatches, including query width, cache types, selected kernel, and F16
+conversion requirements.
+
+Set `GGML_HIP_FA_Q4_MTP_VEC=1` to enable the experimental Q4_0/Q4_0 vector path
+for up to four query columns. This reuses the existing two-column vector kernel
+and is disabled by default. Use both variables for an A/B run:
+
+```sh
+BATCH=512 GGML_HIP_FA_DEBUG=1 GGML_HIP_FA_Q4_MTP_VEC=1 ./scripts/bench-rocm/bench-rocm.sh
+```
+
+The switch is HIP-only and applies only when both cache tensors are Q4_0. It
+does not add a four-column kernel or change CUDA dispatch. Compare its output,
+acceptance statistics, and sustained decode throughput with the variables unset
+before considering a default change.
+
+## MTP draft length sweep
+
+An exploratory sweep used the Ornith model from the Hugging Face cache with
+batch 512, Q4_0 K/V, and one repetition at each context. The decode results
+were:
+
+| `MTP_N_MAX` | 8K tokens/s | 32K tokens/s |
+| ---: | ---: | ---: |
+| 1 | 62.6 | 46.6 |
+| 2 | 75.0 | 73.9 |
+| 3 | 77.6 | 85.4 |
+| 4 | 68.0 | 82.4 |
+| 5 | 59.3 | 82.6 |
+
+This points to `MTP_N_MAX=3` for the next repeated run. It is not a default
+change until acceptance and draft overhead statistics are collected.
+
+The focused two-repetition MTP=3 run recorded aggregate acceptance through the
+benchmark helper: 40 of 66 draft tokens accepted at 8K and 46 of 51 accepted
+at 32K. The corresponding median decode rates were 76.9 and 85.0 tokens/s.
+The helper now preserves `draft_n` and `draft_n_accepted` in each raw run.
+
+## Chunked GDN prefill investigation
+
+The current HIP Gated DeltaNet kernel keeps each recurrent state shard in
+registers while processing tokens in order. This preserves the state dependency
+without intermediate global-memory writes. Splitting the loop into chunks would
+either add kernel launches and state traffic or require a separate parallel scan
+kernel. Both choices increase complexity and risk changing rollback snapshots.
+
+The 64K prompt measurement completed at 907.8 prompt tokens/s. The 128K
+measurement was stopped after several minutes without completing. The current
+evidence does not justify adding a second HIP GDN implementation, so no
+chunked kernel was added.

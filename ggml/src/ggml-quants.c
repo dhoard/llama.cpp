@@ -611,6 +611,219 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// TurboQuant codebook data
+// ============================================================
+
+static const float turbo_codebook_3bit[8] = {
+    -0.1883972972f, -0.1181399059f, -0.0665857641f, -0.0216044751f,
+     0.0216041461f,  0.0665854520f,  0.1181396281f,  0.1883970748f
+};
+
+static const float turbo_codebook_4bit[16] = {
+    -0.2376389871f, -0.1808080141f, -0.1417777640f, -0.1102646123f,
+    -0.0828112376f, -0.0577640422f, -0.0341540905f, -0.0113168380f,
+     0.0112761586f,  0.0341139667f,  0.0577250301f,  0.0827738972f,
+     0.1102295202f,  0.1417455465f,  0.1807794468f,  0.2376153882f
+};
+
+static void turbo_pack3(const uint8_t * indices, uint8_t * out) {
+    memset(out, 0, 12);
+    for (int i = 0; i < 32; i++) {
+        const int bit_off = i * 3;
+        const int byte_idx = bit_off / 8;
+        const int shift = bit_off % 8;
+        out[byte_idx] |= (uint8_t) ((indices[i] & 0x07) << shift);
+        if (shift > 5 && byte_idx + 1 < 12) {
+            out[byte_idx + 1] |= (uint8_t) ((indices[i] & 0x07) >> (8 - shift));
+        }
+    }
+}
+
+static void turbo_unpack3(const uint8_t * packed, uint8_t * indices) {
+    for (int i = 0; i < 32; i++) {
+        const int bit_off = i * 3;
+        const int byte_idx = bit_off / 8;
+        const int shift = bit_off % 8;
+        uint16_t raw = (uint16_t) packed[byte_idx] >> shift;
+        if (shift > 5 && byte_idx + 1 < 12) {
+            raw |= (uint16_t) packed[byte_idx + 1] << (8 - shift);
+        }
+        indices[i] = (uint8_t) (raw & 0x07);
+    }
+}
+
+static void turbo_pack4(const uint8_t * indices, uint8_t * out) {
+    for (int i = 0; i < 16; i++) {
+        out[i] = (indices[2*i] & 0x0F) | ((indices[2*i + 1] & 0x0F) << 4);
+    }
+}
+
+static void turbo_unpack4(const uint8_t * packed, uint8_t * indices) {
+    for (int i = 0; i < 16; i++) {
+        indices[2*i] = packed[i] & 0x0F;
+        indices[2*i + 1] = (packed[i] >> 4) & 0x0F;
+    }
+}
+
+static uint8_t turbo_quantize_scalar(float val, const float * codebook, int n_codes) {
+    float best_dist = fabsf(val - codebook[0]);
+    uint8_t best_idx = 0;
+    for (int i = 1; i < n_codes; i++) {
+        const float dist = fabsf(val - codebook[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = (uint8_t) i;
+        }
+    }
+    return best_idx;
+}
+
+static void turbo_quantize_values(const float * src, int n, uint8_t * indices, float * norm, const float * codebook, int n_codes) {
+    // llama applies the KV-cache Hadamard rotation before this quantizer.
+    float sum_sq = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum_sq += src[i] * src[i];
+    }
+
+    *norm = sqrtf(sum_sq);
+    const float inv_norm = *norm > 1e-10f ? 1.0f / *norm : 0.0f;
+    for (int i = 0; i < n; i++) {
+        indices[i] = turbo_quantize_scalar(src[i] * inv_norm, codebook, n_codes);
+    }
+}
+
+static void turbo_quantize_chunk(const float * src, uint8_t * indices, float * norm, const float * codebook, int n_codes) {
+    turbo_quantize_values(src, TURBO_HEAD_DIM, indices, norm, codebook, n_codes);
+}
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT src, block_turbo3_0 * GGML_RESTRICT dst, int64_t k) {
+    assert(k % TURBO3_BLOCK_SIZE == 0);
+
+    uint8_t indices[TURBO_HEAD_DIM];
+    int64_t blocks_done = 0;
+    if (k % TURBO_HEAD_DIM == 0) {
+        for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+            float norm = 0.0f;
+            turbo_quantize_chunk(src + offset, indices, &norm, turbo_codebook_3bit, 8);
+            for (int blk = 0; blk < TURBO_BLOCKS_PER_CHUNK; blk++) {
+                dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+                turbo_pack3(indices + blk * TURBO3_BLOCK_SIZE, dst[blocks_done].qs);
+                blocks_done++;
+            }
+        }
+    } else {
+        for (int64_t offset = 0; offset < k; offset += TURBO3_BLOCK_SIZE) {
+            float norm = 0.0f;
+            turbo_quantize_values(src + offset, TURBO3_BLOCK_SIZE, indices, &norm, turbo_codebook_3bit, 8);
+            dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+            turbo_pack3(indices, dst[blocks_done].qs);
+            blocks_done++;
+        }
+    }
+}
+
+void quantize_row_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_turbo3_0_ref(src, (block_turbo3_0 *) dst, k);
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % TURBO3_BLOCK_SIZE == 0);
+    const int64_t num_blocks = k / TURBO3_BLOCK_SIZE;
+    for (int64_t b = 0; b < num_blocks; b++) {
+        uint8_t indices[32];
+        turbo_unpack3(x[b].qs, indices);
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+        for (int i = 0; i < TURBO3_BLOCK_SIZE; i++) {
+            y[b * TURBO3_BLOCK_SIZE + i] = turbo_codebook_3bit[indices[i]] * norm;
+        }
+    }
+}
+
+void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT src, block_turbo4_0 * GGML_RESTRICT dst, int64_t k) {
+    assert(k % TURBO4_BLOCK_SIZE == 0);
+
+    uint8_t indices[TURBO_HEAD_DIM];
+    int64_t blocks_done = 0;
+    if (k % TURBO_HEAD_DIM == 0) {
+        for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+            float norm = 0.0f;
+            turbo_quantize_chunk(src + offset, indices, &norm, turbo_codebook_4bit, 16);
+            for (int blk = 0; blk < TURBO_BLOCKS_PER_CHUNK; blk++) {
+                dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+                turbo_pack4(indices + blk * TURBO4_BLOCK_SIZE, dst[blocks_done].qs);
+                blocks_done++;
+            }
+        }
+    } else {
+        for (int64_t offset = 0; offset < k; offset += TURBO4_BLOCK_SIZE) {
+            float norm = 0.0f;
+            turbo_quantize_values(src + offset, TURBO4_BLOCK_SIZE, indices, &norm, turbo_codebook_4bit, 16);
+            dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+            turbo_pack4(indices, dst[blocks_done].qs);
+            blocks_done++;
+        }
+    }
+}
+
+void quantize_row_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_turbo4_0_ref(src, (block_turbo4_0 *) dst, k);
+}
+
+void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % TURBO4_BLOCK_SIZE == 0);
+    const int64_t num_blocks = k / TURBO4_BLOCK_SIZE;
+    for (int64_t b = 0; b < num_blocks; b++) {
+        uint8_t indices[32];
+        turbo_unpack4(x[b].qs, indices);
+        const float norm = GGML_FP16_TO_FP32(x[b].d);
+        for (int i = 0; i < TURBO4_BLOCK_SIZE; i++) {
+            y[b * TURBO4_BLOCK_SIZE + i] = turbo_codebook_4bit[indices[i]] * norm;
+        }
+    }
+}
+
+void ggml_vec_dot_turbo3_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    const float * y = (const float *) vy;
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(nrc);
+
+    float sum = 0.0f;
+    for (int i = 0; i < n / TURBO3_BLOCK_SIZE; i++) {
+        uint8_t indices[32];
+        turbo_unpack3(x[i].qs, indices);
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < TURBO3_BLOCK_SIZE; j++) {
+            sum += turbo_codebook_3bit[indices[j]] * norm * y[i * TURBO3_BLOCK_SIZE + j];
+        }
+    }
+    *s = sum;
+}
+
+void ggml_vec_dot_turbo4_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    const float * y = (const float *) vy;
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(nrc);
+
+    float sum = 0.0f;
+    for (int i = 0; i < n / TURBO4_BLOCK_SIZE; i++) {
+        uint8_t indices[32];
+        turbo_unpack4(x[i].qs, indices);
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < TURBO4_BLOCK_SIZE; j++) {
+            sum += turbo_codebook_4bit[indices[j]] * norm * y[i * TURBO4_BLOCK_SIZE + j];
+        }
+    }
+    *s = sum;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -5603,6 +5816,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_turbo3_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO4_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_turbo4_0, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

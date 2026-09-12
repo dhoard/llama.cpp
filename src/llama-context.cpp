@@ -3699,6 +3699,13 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    const bool turbo_k = params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0;
+    const bool turbo_v = params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0;
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED && (turbo_k || turbo_v)) {
+        LLAMA_LOG_WARN("%s: TurboQuant cache types require flash_attn - enabling automatically\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);

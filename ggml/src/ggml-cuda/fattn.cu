@@ -5,6 +5,9 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <atomic>
+#include <cinttypes>
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
@@ -479,7 +482,71 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
-// K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
+static bool ggml_cuda_fattn_q4_mtp_vec_enabled(const ggml_tensor * K, const ggml_tensor * V) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_HIP_FA_Q4_MTP_VEC");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
+#else
+    GGML_UNUSED_VARS(K, V);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+static const char * ggml_cuda_fattn_kernel_name(const best_fattn_kernel kernel) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_TILE:    return "tile";
+        case BEST_FATTN_KERNEL_VEC:     return "vec";
+        case BEST_FATTN_KERNEL_MMA_F16: return "mma_f16";
+        case BEST_FATTN_KERNEL_NONE:    return "none";
+    }
+    return "unknown";
+}
+
+static void ggml_cuda_fattn_debug(const ggml_tensor * dst, const best_fattn_kernel kernel, const int device) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_HIP_FA_DEBUG");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    static std::atomic<int> count = 0;
+
+    if (!enabled) {
+        return;
+    }
+
+    const int index = count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 32) {
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const bool f16_fallback = kernel == BEST_FATTN_KERNEL_VEC &&
+        ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
+    const bool convert_K = kernel == BEST_FATTN_KERNEL_TILE || kernel == BEST_FATTN_KERNEL_MMA_F16 ||
+        (kernel == BEST_FATTN_KERNEL_VEC && (K->type == GGML_TYPE_F32 || f16_fallback));
+    const bool convert_V = kernel == BEST_FATTN_KERNEL_TILE || kernel == BEST_FATTN_KERNEL_MMA_F16 ||
+        (kernel == BEST_FATTN_KERNEL_VEC && (V->type == GGML_TYPE_F32 || f16_fallback));
+
+    GGML_LOG_INFO("FA_DBG backend=HIP device=%d cc=0x%x q=%" PRId64 " kv=%" PRId64 " head_dim=%" PRId64
+                  " K=%s V=%s kernel=%s convert_k=%d convert_v=%d\n",
+                  device, ggml_cuda_info().devices[device].cc & 0xffff,
+                  Q->ne[1], K->ne[1], Q->ne[0], ggml_type_name(K->type), ggml_type_name(V->type),
+                  ggml_cuda_fattn_kernel_name(kernel), convert_K, convert_V);
+#else
+    GGML_UNUSED_VARS(dst, kernel, device);
+#endif // defined(GGML_USE_HIP)
+}
+
+static bool ggml_cuda_fattn_type_is_turbo(const ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
+// K/V types accepted by the FA path; non-vector types are converted to f16:
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -490,6 +557,8 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             return true;
         default:
             return false;
@@ -590,7 +659,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool kv_is_turbo = ggml_cuda_fattn_type_is_turbo(K->type) || ggml_cuda_fattn_type_is_turbo(V->type);
+    const bool can_use_vector_kernel = !kv_is_turbo && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -660,7 +730,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            if (Q->ne[1] <= (ggml_cuda_fattn_q4_mtp_vec_enabled(K, V) ? 4 : 2)) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
@@ -706,7 +776,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const int device = ggml_cuda_get_device();
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+    ggml_cuda_fattn_debug(dst, kernel, device);
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

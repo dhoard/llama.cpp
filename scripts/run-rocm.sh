@@ -56,6 +56,12 @@ docker_args=(
 if [[ -n ${HF_TOKEN:-} ]]; then
     docker_args+=(--env HF_TOKEN)
 fi
+if [[ -n ${GGML_HIP_FA_DEBUG:-} ]]; then
+    docker_args+=(--env GGML_HIP_FA_DEBUG)
+fi
+if [[ -n ${GGML_HIP_FA_Q4_MTP_VEC:-} ]]; then
+    docker_args+=(--env GGML_HIP_FA_Q4_MTP_VEC)
+fi
 if [[ "$GDN_OPT" == 0 ]]; then
     docker_args+=(--env GGML_HIP_GDN_OPT=0)
 fi

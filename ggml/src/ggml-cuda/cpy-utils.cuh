@@ -211,6 +211,78 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+static __device__ const float cpy_turbo_codebook_3bit[8] = {
+    -0.1883972972f, -0.1181399059f, -0.0665857641f, -0.0216044751f,
+     0.0216041461f,  0.0665854520f,  0.1181396281f,  0.1883970748f
+};
+
+static __device__ const float cpy_turbo_codebook_4bit[16] = {
+    -0.2376389871f, -0.1808080141f, -0.1417777640f, -0.1102646123f,
+    -0.0828112376f, -0.0577640422f, -0.0341540905f, -0.0113168380f,
+     0.0112761586f,  0.0341139667f,  0.0577250301f,  0.0827738972f,
+     0.1102295202f,  0.1417455465f,  0.1807794468f,  0.2376153882f
+};
+
+static __device__ uint8_t cpy_turbo_nearest(float value, const float * codebook, int n) {
+    float best_dist = fabsf(value - codebook[0]);
+    uint8_t best = 0;
+    for (int i = 1; i < n; ++i) {
+        const float dist = fabsf(value - codebook[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = (uint8_t) i;
+        }
+    }
+    return best;
+}
+
+static __device__ void cpy_blck_f32_turbo3_0(const char * cxi, char * cdsti) {
+    const float * x = (const float *) cxi;
+    block_turbo3_0 * y = (block_turbo3_0 *) cdsti;
+    float sum_sq = 0.0f;
+    uint8_t indices[TURBO3_BLOCK_SIZE];
+
+    for (int i = 0; i < TURBO3_BLOCK_SIZE; ++i) {
+        sum_sq += x[i] * x[i];
+    }
+    const float norm = sqrtf(sum_sq);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    y->d = __float2half(norm);
+
+    for (int i = 0; i < TURBO3_BLOCK_SIZE; ++i) {
+        indices[i] = cpy_turbo_nearest(x[i] * inv_norm, cpy_turbo_codebook_3bit, 8);
+    }
+    memset(y->qs, 0, sizeof(y->qs));
+    for (int i = 0; i < TURBO3_BLOCK_SIZE; ++i) {
+        const int bit_offset = i * 3;
+        const int byte_index = bit_offset / 8;
+        const int shift = bit_offset % 8;
+        y->qs[byte_index] |= (uint8_t) ((indices[i] & 0x07) << shift);
+        if (shift > 5) {
+            y->qs[byte_index + 1] |= (uint8_t) ((indices[i] & 0x07) >> (8 - shift));
+        }
+    }
+}
+
+static __device__ void cpy_blck_f32_turbo4_0(const char * cxi, char * cdsti) {
+    const float * x = (const float *) cxi;
+    block_turbo4_0 * y = (block_turbo4_0 *) cdsti;
+    float sum_sq = 0.0f;
+
+    for (int i = 0; i < TURBO4_BLOCK_SIZE; ++i) {
+        sum_sq += x[i] * x[i];
+    }
+    const float norm = sqrtf(sum_sq);
+    const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    y->d = __float2half(norm);
+
+    for (int i = 0; i < TURBO4_BLOCK_SIZE / 2; ++i) {
+        const uint8_t idx0 = cpy_turbo_nearest(x[2*i] * inv_norm, cpy_turbo_codebook_4bit, 16);
+        const uint8_t idx1 = cpy_turbo_nearest(x[2*i + 1] * inv_norm, cpy_turbo_codebook_4bit, 16);
+        y->qs[i] = (idx0 & 0x0F) | ((idx1 & 0x0F) << 4);
+    }
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

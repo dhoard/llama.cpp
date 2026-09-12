@@ -119,6 +119,61 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+__device__ __constant__ static float dc_codebook_3bit[8] = {
+    -0.1883972972f, -0.1181399059f, -0.0665857641f, -0.0216044751f,
+     0.0216041461f,  0.0665854520f,  0.1181396281f,  0.1883970748f
+};
+
+__device__ __constant__ static float dc_codebook_4bit[16] = {
+    -0.2376389871f, -0.1808080141f, -0.1417777640f, -0.1102646123f,
+    -0.0828112376f, -0.0577640422f, -0.0341540905f, -0.0113168380f,
+     0.0112761586f,  0.0341139667f,  0.0577250301f,  0.0827738972f,
+     0.1102295202f,  0.1417455465f,  0.1807794468f,  0.2376153882f
+};
+
+static __device__ __forceinline__ void dequantize_turbo3_0(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx + ib;
+    const uint8_t * qs = x->qs;
+
+    const int elem0 = iqs;
+    const int elem1 = elem0 + 1;
+
+    const int bit_off0 = elem0 * 3;
+    const int byte0 = bit_off0 / 8;
+    const int shift0 = bit_off0 % 8;
+    uint16_t raw0 = (uint16_t) qs[byte0] >> shift0;
+    if (shift0 > 5 && byte0 + 1 < 12) {
+        raw0 |= (uint16_t) qs[byte0 + 1] << (8 - shift0);
+    }
+    const uint8_t idx0 = (uint8_t) (raw0 & 0x07);
+
+    const int bit_off1 = elem1 * 3;
+    const int byte1 = bit_off1 / 8;
+    const int shift1 = bit_off1 % 8;
+    uint16_t raw1 = (uint16_t) qs[byte1] >> shift1;
+    if (shift1 > 5 && byte1 + 1 < 12) {
+        raw1 |= (uint16_t) qs[byte1 + 1] << (8 - shift1);
+    }
+    const uint8_t idx1 = (uint8_t) (raw1 & 0x07);
+
+    const float norm = __half2float(x->d);
+    v.x = dc_codebook_3bit[idx0] * norm;
+    v.y = dc_codebook_3bit[idx1] * norm;
+}
+
+static __device__ __forceinline__ void dequantize_turbo4_0(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx + ib;
+    const uint8_t packed = x->qs[iqs / 2];
+    const uint8_t idx0 = packed & 0x0F;
+    const uint8_t idx1 = (packed >> 4) & 0x0F;
+
+    const float norm = __half2float(x->d);
+    v.x = dc_codebook_4bit[idx0] * norm;
+    v.y = dc_codebook_4bit[idx1] * norm;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

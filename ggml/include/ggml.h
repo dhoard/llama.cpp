@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO3_0 = 43, // TurboQuant 3-bit KV-cache (3.5 bpw)
+        GGML_TYPE_TURBO4_0 = 44, // TurboQuant 4-bit KV-cache (4.5 bpw)
+        GGML_TYPE_COUNT   = 45,
     };
 
     // [TAG_GGML_PREC]

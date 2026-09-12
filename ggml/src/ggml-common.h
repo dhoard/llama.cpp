@@ -226,6 +226,26 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+#define TURBO3_BLOCK_SIZE 32
+#define QK_TURBO3 32
+#define QR_TURBO3 1
+#define TURBO_HEAD_DIM 128
+#define TURBO_BLOCKS_PER_CHUNK (TURBO_HEAD_DIM / TURBO3_BLOCK_SIZE)
+typedef struct {
+    ggml_half d;
+    uint8_t qs[12];
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == 14, "wrong turbo3 block size");
+
+#define TURBO4_BLOCK_SIZE 32
+#define QK_TURBO4 32
+#define QR_TURBO4 1
+typedef struct {
+    ggml_half d;
+    uint8_t qs[16];
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == 18, "wrong turbo4 block size");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

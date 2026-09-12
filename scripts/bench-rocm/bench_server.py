@@ -77,6 +77,8 @@ def completion(url, prompt, n_predict, timeout, seed):
         "prompt_per_second": timings.get("prompt_per_second", 0.0),
         "predicted_n": timings.get("predicted_n", 0),
         "predicted_per_second": timings.get("predicted_per_second", 0.0),
+        "draft_n": timings.get("draft_n", 0),
+        "draft_n_accepted": timings.get("draft_n_accepted", 0),
     }
 
 

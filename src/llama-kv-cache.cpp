@@ -227,6 +227,21 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+        if (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
+            if (n_embd_head_k % 128 != 0) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires K head_dim to be a multiple of 128, got %d (layer %d)\n", __func__, n_embd_head_k, il);
+                throw std::runtime_error("TurboQuant requires K head_dim to be a multiple of 128");
+            }
+        }
+        if (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
+            if (n_embd_head_v % 128 != 0) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires V head_dim to be a multiple of 128, got %d (layer %d)\n", __func__, n_embd_head_v, il);
+                throw std::runtime_error("TurboQuant requires V head_dim to be a multiple of 128");
+            }
+        }
+
         const bool has_k = true;
         const bool has_v = !is_mla;
 
@@ -1436,7 +1451,7 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        int nrot = 64;
+        int nrot = type_k() == GGML_TYPE_TURBO3_0 || type_k() == GGML_TYPE_TURBO4_0 ? 128 : 64;
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
@@ -1457,7 +1472,7 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_v) {
-        int nrot = 64;
+        int nrot = type_v() == GGML_TYPE_TURBO3_0 || type_v() == GGML_TYPE_TURBO4_0 ? 128 : 64;
         // using smaller rotation matrices for V seems beneficial
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
         //do {

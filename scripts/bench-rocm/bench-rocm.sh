@@ -45,7 +45,7 @@ cd "$ROOT_DIR"
 
 commit=$(git rev-parse HEAD)
 image_id=$("$DOCKER" image inspect --format '{{.Id}}' "$IMAGE")
-metadata=$(python3 - "$IMAGE" "$image_id" "$commit" "$MODEL" "$CTX" "$PARALLEL" "$BATCH" "$UBATCH" "$THREADS" "$THREADS_BATCH" "$CACHE_TYPE_K" "$CACHE_TYPE_V" "$CACHE_REUSE" "$REASONING_BUDGET" "$MTP_N_MAX" "$GDN_OPT" "$SPARSE_ATTN_MODE" "$REPETITIONS" "$WARMUPS" "$N_PREDICT" <<'PY'
+metadata=$(python3 - "$IMAGE" "$image_id" "$commit" "$MODEL" "$CTX" "$PARALLEL" "$BATCH" "$UBATCH" "$THREADS" "$THREADS_BATCH" "$CACHE_TYPE_K" "$CACHE_TYPE_V" "$CACHE_REUSE" "$REASONING_BUDGET" "$MTP_N_MAX" "$GDN_OPT" "$SPARSE_ATTN_MODE" "$REPETITIONS" "$WARMUPS" "$N_PREDICT" "${GGML_HIP_FA_DEBUG:-}" "${GGML_HIP_FA_Q4_MTP_VEC:-}" <<'PY'
 import json
 import sys
 
@@ -70,6 +70,8 @@ keys = (
     "repetitions",
     "warmups",
     "n_predict",
+    "fa_debug",
+    "fa_q4_mtp_vec",
 )
 values = sys.argv[1:]
 data = dict(zip(keys, values))
@@ -95,6 +97,12 @@ docker_args=(
 )
 if [[ -n ${HF_TOKEN:-} ]]; then
     docker_args+=(--env HF_TOKEN)
+fi
+if [[ -n ${GGML_HIP_FA_DEBUG:-} ]]; then
+    docker_args+=(--env GGML_HIP_FA_DEBUG)
+fi
+if [[ -n ${GGML_HIP_FA_Q4_MTP_VEC:-} ]]; then
+    docker_args+=(--env GGML_HIP_FA_Q4_MTP_VEC)
 fi
 if [[ "$GDN_OPT" == 0 ]]; then
     docker_args+=(--env GGML_HIP_GDN_OPT=0)
