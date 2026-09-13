@@ -4,6 +4,8 @@
 #include "llama.h"
 
 #include <string>
+#include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -616,6 +618,7 @@ struct server_prompt_cache {
     }
 
     std::list<server_prompt_cache_state> states;
+    std::unordered_multimap<uint64_t, server_prompt_cache_state *> exact_index;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -632,6 +635,11 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+private:
+    static uint64_t hash_tokens(const server_tokens & tokens);
+    void index_state(server_prompt_cache_state * state);
+    void unindex_state(server_prompt_cache_state * state);
 };
 
 // used exclusively by router mode

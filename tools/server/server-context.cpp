@@ -26,6 +26,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <list>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -4254,6 +4255,237 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+struct server_tokenization_cache {
+    struct entry {
+        const llama_vocab * vocab;
+        std::string prompt;
+        llama_tokens tokens;
+        std::vector<std::pair<size_t, size_t>> control_boundaries;
+    };
+
+    explicit server_tokenization_cache(size_t max_entries) : max_entries(max_entries) {}
+
+    std::shared_ptr<const entry> find_exact(const llama_vocab * vocab, const std::string & prompt) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if ((*it)->vocab == vocab && (*it)->prompt == prompt) {
+                auto result = *it;
+                entries.splice(entries.begin(), entries, it);
+                return result;
+            }
+        }
+        return nullptr;
+    }
+
+    std::shared_ptr<const entry> find_prefix(const llama_vocab * vocab, const std::string & prompt) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::shared_ptr<const entry> result;
+        auto result_it = entries.end();
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if ((*it)->vocab == vocab && (*it)->prompt.size() < prompt.size() &&
+                    prompt.compare(0, (*it)->prompt.size(), (*it)->prompt) == 0 &&
+                    (!result || (*it)->prompt.size() > result->prompt.size())) {
+                result = *it;
+                result_it = it;
+            }
+        }
+        if (result) {
+            entries.splice(entries.begin(), entries, result_it);
+        }
+        return result;
+    }
+
+    void insert(const llama_vocab * vocab, std::string prompt, llama_tokens tokens) {
+        auto value = std::make_shared<entry>();
+        value->vocab = vocab;
+        value->prompt = std::move(prompt);
+        value->tokens = std::move(tokens);
+
+        size_t search_pos = 0;
+        for (size_t i = 0; i < value->tokens.size(); ++i) {
+            if (!llama_vocab_is_control(vocab, value->tokens[i])) {
+                continue;
+            }
+            const std::string piece = common_token_to_piece(vocab, value->tokens[i], true);
+            const size_t pos = piece.empty() ? std::string::npos : value->prompt.find(piece, search_pos);
+            if (pos == std::string::npos) {
+                continue;
+            }
+            search_pos = pos + piece.size();
+            value->control_boundaries.emplace_back(search_pos, i + 1);
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if ((*it)->vocab == vocab && (*it)->prompt == value->prompt) {
+                entries.erase(it);
+                break;
+            }
+        }
+        entries.push_front(std::move(value));
+        if (entries.size() > max_entries) {
+            entries.pop_back();
+        }
+    }
+
+private:
+    size_t max_entries;
+    std::mutex mutex;
+    std::list<std::shared_ptr<entry>> entries;
+};
+
+struct server_chat_render_cache {
+    struct entry {
+        std::string key;
+        std::shared_ptr<const json> data;
+    };
+
+    explicit server_chat_render_cache(size_t max_entries) : max_entries(max_entries) {}
+
+    std::shared_ptr<const json> find(const std::string & key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if ((*it)->key == key) {
+                auto result = *it;
+                entries.splice(entries.begin(), entries, it);
+                return result->data;
+            }
+        }
+        return nullptr;
+    }
+
+    void insert(std::string key, std::shared_ptr<const json> data) {
+        auto value = std::make_shared<entry>();
+        value->key = std::move(key);
+        value->data = std::move(data);
+
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if ((*it)->key == value->key) {
+                entries.erase(it);
+                break;
+            }
+        }
+        entries.push_front(std::move(value));
+        if (entries.size() > max_entries) {
+            entries.pop_back();
+        }
+    }
+
+private:
+    size_t max_entries;
+    std::mutex mutex;
+    std::list<std::shared_ptr<entry>> entries;
+};
+
+struct server_task_params_cache {
+    struct entry {
+        const llama_vocab * vocab;
+        const common_params * params_base;
+        std::string key;
+        std::shared_ptr<const task_params> params;
+    };
+
+    explicit server_task_params_cache(size_t max_entries) : max_entries(max_entries) {}
+
+    std::shared_ptr<const task_params> find(const llama_vocab * vocab, const common_params * params_base, const std::string & key) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if ((*it)->vocab == vocab && (*it)->params_base == params_base && (*it)->key == key) {
+                auto result = *it;
+                entries.splice(entries.begin(), entries, it);
+                return result->params;
+            }
+        }
+        return nullptr;
+    }
+
+    void insert(const llama_vocab * vocab, const common_params * params_base, std::string key, std::shared_ptr<const task_params> params) {
+        auto value = std::make_shared<entry>();
+        value->vocab = vocab;
+        value->params_base = params_base;
+        value->key = std::move(key);
+        value->params = std::move(params);
+
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if ((*it)->vocab == vocab && (*it)->params_base == params_base && (*it)->key == value->key) {
+                entries.erase(it);
+                break;
+            }
+        }
+        entries.push_front(std::move(value));
+        if (entries.size() > max_entries) {
+            entries.pop_back();
+        }
+    }
+
+private:
+    size_t max_entries;
+    std::mutex mutex;
+    std::list<std::shared_ptr<entry>> entries;
+};
+
+static bool server_chat_render_cacheable(const json & body, const std::vector<raw_buffer> & files) {
+    if (!files.empty() || !body.contains("messages") || !body.at("messages").is_array()) {
+        return false;
+    }
+    for (const auto & message : body.at("messages")) {
+        if (message.contains("content") && message.at("content").is_array()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string server_chat_render_cache_key(const json & body, const server_chat_params & opt) {
+    std::string key = body.dump();
+    key += string_format("|%p|%d|%d|%d|%d|%d|%d|%d|%d|%d|",
+            static_cast<const void *>(opt.tmpls.get()),
+            opt.use_jinja,
+            opt.prefill_assistant,
+            static_cast<int>(opt.reasoning_format),
+            opt.allow_image,
+            opt.allow_audio,
+            opt.allow_video,
+            opt.enable_thinking,
+            opt.reasoning_budget,
+            opt.force_pure_content);
+    key += opt.reasoning_budget_message;
+    key += "|" + opt.media_path + "|";
+    for (const auto & item : opt.chat_template_kwargs) {
+        key += item.first + "=" + item.second + ";";
+    }
+    return key;
+}
+
+static bool server_tokenize_incremental(
+        const llama_vocab * vocab,
+        const server_tokenization_cache::entry & old,
+        const std::string & prompt,
+        llama_tokens & output,
+        size_t & reused) {
+    if (prompt.size() <= old.prompt.size() || prompt.compare(0, old.prompt.size(), old.prompt) != 0) {
+        return false;
+    }
+
+    size_t boundary_pos = 0;
+    size_t boundary_tokens = 0;
+    for (const auto & boundary : old.control_boundaries) {
+        boundary_pos = boundary.first;
+        boundary_tokens = boundary.second;
+    }
+    if (boundary_tokens == 0) {
+        return false;
+    }
+
+    output.assign(old.tokens.begin(), old.tokens.begin() + boundary_tokens);
+    const llama_tokens suffix = common_tokenize(vocab, prompt.substr(boundary_pos), false, true);
+    output.insert(output.end(), suffix.begin(), suffix.end());
+    reused = boundary_tokens;
+    return true;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4294,6 +4526,29 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+        } else if (params.incremental_tokenization && prompt.is_string()) {
+            const std::string prompt_text = prompt.get<std::string>();
+            auto cached = token_cache->find_exact(ctx_server.vocab, prompt_text);
+            if (cached) {
+                SRV_DBG("token cache: exact hit, reused %zu / %zu tokens\n", cached->tokens.size(), cached->tokens.size());
+                inputs.emplace_back(cached->tokens, false);
+            } else {
+                llama_tokens tokens;
+                size_t reused = 0;
+                const int64_t t_tokenize_start = ggml_time_us();
+                cached = token_cache->find_prefix(ctx_server.vocab, prompt_text);
+                if (cached && server_tokenize_incremental(ctx_server.vocab, *cached, prompt_text, tokens, reused)) {
+                    SRV_DBG("token cache: incremental hit, reused %zu / %zu tokens, tokenized %zu tokens in %.2f ms\n",
+                            reused, tokens.size(), tokens.size() - reused,
+                            (ggml_time_us() - t_tokenize_start) / 1000.0);
+                } else {
+                    tokens = common_tokenize(ctx_server.vocab, prompt_text, true, true);
+                    SRV_DBG("token cache: fallback, tokenized %zu tokens in %.2f ms\n", tokens.size(),
+                            (ggml_time_us() - t_tokenize_start) / 1000.0);
+                }
+                token_cache->insert(ctx_server.vocab, prompt_text, tokens);
+                inputs.emplace_back(tokens, false);
+            }
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
@@ -4312,11 +4567,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id = rd.get_new_id();
 
             task.tokens = std::move(inputs[i]);
-            task.params = server_schema::eval_llama_cmpl_schema(
-                    ctx_server.vocab,
-                    params,
-                    meta->logit_bias_eog,
-                    data);
+            const std::string params_key = data.dump();
+            auto cached_params = task_params_cache->find(ctx_server.vocab, &params, params_key);
+            if (cached_params) {
+                task.params = *cached_params;
+                SRV_DBG("%s\n", "task params cache: exact hit");
+            } else {
+                task.params = server_schema::eval_llama_cmpl_schema(
+                        ctx_server.vocab,
+                        params,
+                        meta->logit_bias_eog,
+                        data);
+                task_params_cache->insert(ctx_server.vocab, &params, params_key,
+                        std::make_shared<const task_params>(task.params));
+            }
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
@@ -4530,7 +4794,10 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
         : params(params),
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
-          queue_results(ctx_server.impl->queue_results) {
+          queue_results(ctx_server.impl->queue_results),
+          token_cache(std::make_unique<server_tokenization_cache>(std::max<int32_t>(4, params.n_parallel * 2))),
+          chat_cache(std::make_unique<server_chat_render_cache>(std::max<int32_t>(4, params.n_parallel * 2))),
+          task_params_cache(std::make_unique<server_task_params_cache>(std::max<int32_t>(4, params.n_parallel * 2))) {
     init_routes();
 
     // note: this must be registered before load_model()
@@ -4539,6 +4806,8 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
         update_cached_responses(is_sleeping);
     });
 }
+
+server_routes::~server_routes() = default;
 
 static json get_res_model_info(const server_context_meta & meta) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
@@ -4931,14 +5200,29 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        std::shared_ptr<const json> body_parsed;
+        if (params.incremental_tokenization && server_chat_render_cacheable(body, files)) {
+            const std::string key = server_chat_render_cache_key(body, meta->chat_params);
+            body_parsed = chat_cache->find(key);
+            if (body_parsed) {
+                SRV_DBG("%s\n", "chat template cache: exact hit");
+            } else {
+                body_parsed = std::make_shared<const json>(oaicompat_chat_params_parse(
+                    body,
+                    meta->chat_params,
+                    files));
+                chat_cache->insert(key, body_parsed);
+            }
+        } else {
+            body_parsed = std::make_shared<const json>(oaicompat_chat_params_parse(
+                body,
+                meta->chat_params,
+                files));
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
+            *body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT);
     };

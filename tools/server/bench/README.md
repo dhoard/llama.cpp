@@ -69,6 +69,17 @@ SERVER_BENCH_N_PROMPTS=500 k6 run script.js --duration 10m --iterations 500 --vu
 
 To [debug http request](https://k6.io/docs/using-k6/http-debugging/) use `--http-debug="full"`.
 
+#### Incremental tokenization
+
+`bench_incremental_tokenization.py` sends ordinary OpenAI-compatible requests with the complete history on every request. It supports `cold`, `exact`, `append`, `edit`, `truncate`, and `eviction` scenarios and uses only the Python standard library.
+
+```shell
+python bench_incremental_tokenization.py --endpoint http://localhost:8000/v1/chat/completions \
+  --model my-model --scenario append --context-chars 128000 --output results.json
+```
+
+Run once with `--no-incremental-tokenization` and once with the default enabled setting. Use server debug logs to verify `exact hit`, `incremental hit`, or `fallback` was reported.
+
 #### Metrics
 
 Following metrics are available computed from the OAI chat completions response `usage`:

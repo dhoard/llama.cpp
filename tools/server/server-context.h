@@ -115,9 +115,13 @@ struct server_context {
 
 // forward declarations
 struct server_res_generator;
+struct server_tokenization_cache;
+struct server_chat_render_cache;
+struct server_task_params_cache;
 
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
+    ~server_routes();
 
     void init_routes();
 
@@ -179,6 +183,9 @@ private:
 
     server_queue & queue_tasks;
     server_response & queue_results;
+    std::unique_ptr<server_tokenization_cache> token_cache;
+    std::unique_ptr<server_chat_render_cache> chat_cache;
+    std::unique_ptr<server_task_params_cache> task_params_cache;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
     // cached responses, to be used during sleep

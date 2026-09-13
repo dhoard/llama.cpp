@@ -1,4 +1,6 @@
 import pytest
+import os
+import tempfile
 from openai import OpenAI
 from utils import *
 
@@ -71,6 +73,107 @@ def test_chat_completion_cached_tokens():
         })
         assert res.body["usage"]["prompt_tokens"] == n_prompt
         assert res.body["usage"]["prompt_tokens_details"]["cached_tokens"] == n_cache
+
+
+def test_incremental_tokenization_exact_hit():
+    global server
+    server.debug = True
+    fd, log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    server.log_path = log_path
+    server.start()
+
+    request = {
+        "max_tokens": 1,
+        "messages": [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": "Return the number 1."},
+        ],
+    }
+    first = server.make_request("POST", "/chat/completions", data=request)
+    second = server.make_request("POST", "/chat/completions", data=request)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.body["usage"]["prompt_tokens"] == first.body["usage"]["prompt_tokens"]
+
+    with open(log_path, encoding="utf-8") as log:
+        assert "token cache: exact hit" in log.read()
+
+
+def test_incremental_tokenization_disabled():
+    global server
+    server.debug = True
+    server.incremental_tokenization = False
+    fd, log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    server.log_path = log_path
+    server.start()
+
+    request = {
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "Return the number 1."}],
+    }
+    first = server.make_request("POST", "/chat/completions", data=request)
+    second = server.make_request("POST", "/chat/completions", data=request)
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    with open(log_path, encoding="utf-8") as log:
+        assert "token cache:" not in log.read()
+
+
+def test_incremental_tokenization_matches_canonical_token_count():
+    global server
+    server.chat_template = "llama3"
+    server.n_slots = 2
+    server.debug = True
+    server.start()
+
+    histories = [
+        "plain text",
+        "plain text\n",
+        "plain text\n next turn, punctuation!",
+        "plain text\n next turn, punctuation! 媽 🤗",
+        "plain text\n next turn, punctuation! 媽 🤗\n{\"tool_result\":true}",
+        "edited historical content",
+        "edited",
+    ]
+    for content in histories:
+        messages = [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": content},
+        ]
+        rendered = server.make_request("POST", "/apply-template", data={"messages": messages})
+        assert rendered.status_code == 200
+        canonical = server.make_request("POST", "/tokenize", data={
+            "content": rendered.body["prompt"],
+            "add_special": True,
+            "parse_special": True,
+        })
+        response = server.make_request("POST", "/chat/completions", data={
+            "max_tokens": 1,
+            "messages": messages,
+        })
+        assert canonical.status_code == 200
+        assert response.status_code == 200
+        assert response.body["usage"]["prompt_tokens"] == len(canonical.body["tokens"])
+
+
+def test_incremental_tokenization_concurrent_exact_requests():
+    global server
+    server.n_slots = 2
+    server.start()
+    request = {
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "concurrent exact prompt"}],
+    }
+
+    def send_request(_index):
+        return server.make_request("POST", "/chat/completions", data=request)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(send_request, range(4)))
+    assert all(response.status_code == 200 for response in responses)
 
 @pytest.mark.parametrize(
     "system_prompt,user_prompt,max_tokens,re_content,n_prompt,n_predicted,finish_reason",

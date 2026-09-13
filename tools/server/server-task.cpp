@@ -1688,6 +1688,31 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+uint64_t server_prompt_cache::hash_tokens(const server_tokens & tokens) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (llama_token token : tokens.get_tokens()) {
+        hash ^= static_cast<uint32_t>(token);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= tokens.size();
+    hash *= 1099511628211ULL;
+    return hash;
+}
+
+void server_prompt_cache::index_state(server_prompt_cache_state * state) {
+    exact_index.emplace(hash_tokens(state->prompt.tokens), state);
+}
+
+void server_prompt_cache::unindex_state(server_prompt_cache_state * state) {
+    const auto range = exact_index.equal_range(hash_tokens(state->prompt.tokens));
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == state) {
+            exact_index.erase(it);
+            return;
+        }
+    }
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1710,6 +1735,16 @@ size_t server_prompt_cache::n_tokens() const {
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
+    const auto exact_range = exact_index.equal_range(hash_tokens(prompt.tokens));
+    for (auto it = exact_range.first; it != exact_range.second; ++it) {
+        const auto * state = it->second;
+        if (state->prompt.tokens.size() == prompt.tokens.size() &&
+                state->prompt.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size()) {
+            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            return nullptr;
+        }
+    }
+
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
@@ -1741,6 +1776,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            unindex_state(&*it);
             it = states.erase(it);
         } else {
             ++it;
@@ -1753,6 +1789,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            unindex_state(&states.front());
             states.pop_front();
         }
     }
@@ -1786,6 +1823,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
     });
+    index_state(&states.back());
 
     return &states.back();
 }
@@ -1861,6 +1899,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         prompt = std::move(it_best->prompt);
 
+        unindex_state(&*it_best);
         states.erase(it_best);
     }
 
@@ -1872,6 +1911,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            unindex_state(&states.front());
             states.pop_front();
         }
     }
@@ -1887,6 +1927,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            unindex_state(&states.front());
             states.pop_front();
         }
     }
